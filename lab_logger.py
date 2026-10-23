@@ -629,6 +629,8 @@ class SharedFile:
         raw = json.dumps({k: v for k, v in row.items() if k not in meta}, default=str)
         return {**row, "record_id": f"{row.get('instrument')}-{row.get('source_file')}-{row.get('row')}",
                 "measurement": "Color", "value": Lv, "unit": "L*", "L*": Lv, "a*": av, "b*": bv,
+                "std_L*": _pick(row, "Standard L*"), "std_a*": _pick(row, "Standard a*"),
+                "std_b*": _pick(row, "Standard b*"),
                 "test_name": _pick(row, "Test Name", "TestName", "Name"),
                 "colorimeter_datetime": _pick(row, "DateTime", "Date Time", "Date", "Time"),
                 "raw_text": raw}
@@ -802,12 +804,26 @@ class FolderWatcher(threading.Thread):
             # header = first row with at least 2 non-empty cells
             h_idx = next((i for i, r in enumerate(table)
                           if sum(1 for c in r if str(c).strip()) >= 2), 0)
+            top = [str(c).strip() for c in table[h_idx]]
+            data_start = h_idx + 1
+            # Two-row headers (Linshang: "Standard" / "Sample" above L* a* b*): merge them,
+            # giving "Standard L*", "Sample L*" and so on.
+            nxt = [str(c).strip() for c in table[h_idx + 1]] if len(table) > h_idx + 1 else []
+            if nxt and sum(1 for c in nxt if c) >= 2 and not any(_num(c) is not None for c in nxt if c):
+                group, merged = "", []
+                for i in range(max(len(top), len(nxt))):
+                    t = top[i] if i < len(top) else ""
+                    b = nxt[i] if i < len(nxt) else ""
+                    if t:
+                        group = t if b else ""
+                    merged.append(f"{group} {b}".strip() if b else t)
+                top, data_start = merged, h_idx + 2
             header, seen = [], {}
-            for i, c in enumerate(table[h_idx]):
-                c = str(c).strip() or f"col{i + 1}"
+            for i, c in enumerate(top):
+                c = c or f"col{i + 1}"
                 seen[c] = seen.get(c, 0) + 1
                 header.append(c if seen[c] == 1 else f"{c}_{seen[c]}")
-            for n, r in enumerate(table[h_idx + 1:], start=1):
+            for n, r in enumerate(table[data_start:], start=1):
                 if self.skip_dupes:
                     rid = self.row_id(header, r)
                     if rid in self.seen or rid in new_ids:
