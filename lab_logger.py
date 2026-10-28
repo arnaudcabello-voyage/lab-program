@@ -2694,7 +2694,7 @@ function supportShell(){
       <div id="sSkStatus" class="muted" style="font-size:14px;line-height:1.6"></div>
       <div id="sSkLife" style="font-size:14px;line-height:1.6"></div>
       <form id="sSkForm" style="display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px">
-        <div class="field" style="flex:1 1 320px"><label for="sSkTok">New sign-in token (exchange_token)</label>
+        <div class="field" style="flex:1 1 320px"><label for="sSkTok">New sign-in token</label>
           <input type="password" id="sSkTok" autocomplete="off" placeholder="Paste here (leave empty to keep the current one)" style="width:100%"></div>
         <div class="field"><label for="sSkSer">Browser ID (sbs_serial)</label><input type="text" id="sSkSer" style="width:160px;font-family:var(--mono)"></div>
         <button class="btn dark" type="submit">Save</button>
@@ -2705,13 +2705,13 @@ function supportShell(){
         <ol style="margin:0;padding-left:20px;font-size:14px;line-height:1.7">
           <li>In Chrome, press <b>Ctrl+Shift+B</b> to show the bookmarks bar.</li>
           <li>Drag this button onto the bookmarks bar: <a id="sSkBm" href="#" style="display:inline-block;padding:6px 14px;border-radius:8px;background:var(--accent);color:#fff;text-decoration:none;font-weight:500">Send to Lab Logger</a></li>
-          <li>To connect: open skalacontrol.io, sign in, then click <b>Send to Lab Logger</b>. A tab opens saying "SKALA is connected".</li>
+          <li>To connect: open skalacontrol.io, sign in (pick your name, enter your PIN) so your batches show, then click <b>Send to Lab Logger</b>. A tab opens saying "SKALA is connected".</li>
         </ol>
         <span class="muted" style="font-size:13px">Clicking the button here does nothing; it only works when clicked on the SKALA page.</span>
       </div>
       <details><summary style="cursor:pointer;min-height:40px;display:flex;align-items:center;font-size:14px;color:var(--muted)">Doing it by hand instead</summary>
-        <div style="font-size:14px;line-height:1.7"><b>Token:</b> sign in at skalacontrol.io → press F12 → <b>Application</b> → Local storage → https://skalacontrol.io → click <b>exchange_token</b> → copy its value (without the quotes).<br>
-        <b>Browser ID:</b> in the same list, the value of <b>applicationID</b> (for example SKM16F64).</div></details>
+        <div style="font-size:14px;line-height:1.7"><b>Token:</b> sign in at skalacontrol.io and open your batches → press F12 → <b>Network</b> → click a batch in SKALA → click the request named <b>get_batches_ionic</b> (or any request to lambda-prod) → <b>Headers</b> → under Request Headers, copy the value of <b>token</b> (32 letters and numbers).<br>
+        <b>Browser ID:</b> F12 → <b>Application</b> → Local storage → https://skalacontrol.io → the value of <b>applicationID</b> (for example SKM16F64).</div></details>
       <div id="sSkResult" style="font-size:14px"></div>
     </section>` : ''}
     <section class="card pad" id="sOther" style="gap:12px"><h2>Colorimeter</h2><div id="sOtherBody"></div></section>
@@ -2806,7 +2806,9 @@ function bookmarkletHref(){
   const L = location.origin;
   const code = `(function(){var L=${JSON.stringify(L)};function g(k){var v=localStorage.getItem(k)||'';try{var j=JSON.parse(v);if(typeof j==='string')v=j}catch(e){}return v}`
     + `if(location.hostname.indexOf('skalacontrol')<0){alert('Open SKALA (skalacontrol.io) and sign in first, then click Send to Lab Logger again.');return}`
-    + `var t=g('exchange_token');if(!t){alert('Sign in to SKALA first, then click Send to Lab Logger again.');return}`
+    // SKALA keeps the working sign-in in the open page (the_app.session_manager.userDetails), not in storage.
+    + `var t='';try{var u=window.the_app&&window.the_app.session_manager&&window.the_app.session_manager.userDetails;t=(u&&(u.lambda_token||u.token))||''}catch(e){}`
+    + `if(!t){alert('Sign in to SKALA first (pick your name and enter your PIN), wait until your batches show, then click Send to Lab Logger again.');return}`
     + `var s=g('applicationID');var w=window.open(L+'/#connect-skala','_blank');var n=0,done=false;`
     + `window.addEventListener('message',function(e){if(e.origin===L&&e.data&&e.data.type==='lablogger-ack'){done=true}});`
     + `var iv=setInterval(function(){if(done||n++>40){clearInterval(iv);return}try{w.postMessage({type:'lablogger-skala',token:t,serial:s},L)}catch(e){}},500)})();`;
