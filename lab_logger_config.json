@@ -28,6 +28,9 @@
     "operators": [],
     "block_upload_without_lot": true
   },
+  "void_rules": {
+    "operator_minutes": 30
+  },
   "instruments": [
     {
       "name": "MB90",

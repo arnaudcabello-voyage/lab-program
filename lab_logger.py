@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
                   "support_contact": "your supervisor", "support_pin": ""},
     "upload": {"folder": ""},
     "history": {"enabled": True, "keep_days": 0},
+    "void_rules": {"operator_minutes": 30},
     "lot_rules": {"expire_minutes": 120, "clear_at_midnight": True, "lot_pattern": "", "lot_example": "",
                   "operators": [], "block_upload_without_lot": True},
     "instruments": [
@@ -1523,7 +1524,7 @@ class ExcelBook:
 
         fields, summary = summarize_rows(rows)
         sheet("Lot Summary", fields, summary, first=True)
-        extra = ["lot_assigned_later", "assigned_by", "assigned_at"]
+        extra = ["voided", "void_reason", "voided_by", "voided_at", "lot_assigned_later", "assigned_by", "assigned_at"]
         sheet("All Results", SHARED.columns + [e for e in extra if e not in SHARED.columns], rows)
         # each instrument's full detail
         for sub in sorted(p for p in self.out_dir.iterdir() if p.is_dir()):
@@ -1542,6 +1543,13 @@ class ExcelBook:
                 data = [a for a in rd if (a.get("assigned_at") or "")[:7] == month]
                 flds = rd.fieldnames or []
             sheet("Lot Assignments", flds, data)
+        vf = voids_path()
+        if vf and vf.exists():
+            with open(vf, newline="", encoding="utf-8-sig") as fh:
+                rd = csv.DictReader(fh)
+                data = [v for v in rd if (v.get("when") or "")[:7] == month]
+                flds = rd.fieldnames or []
+            sheet("Voids", flds, data)
         hist = [h for h in (load_upload_state().get("history") or []) if (h.get("when") or "")[:7] == month]
         sheet("Uploads", ["when", "scope", "results", "files", "dest", "operator"], hist)
         ws = wb.create_sheet("About")
@@ -1686,6 +1694,7 @@ NO_LOT_NEEDED = re.compile(r"calibration|statistics|printout", re.I)
 
 def configure_lot_rules(cfg):
     LOT_RULES.update(cfg.get("lot_rules", {}))
+    VOID_RULES.update(cfg.get("void_rules", {}))
 
 
 def context_expires_at():
@@ -1735,7 +1744,7 @@ def check_context(lot, operator):
 
 
 def needs_lot(row):
-    if NO_LOT_NEEDED.search(row.get("measurement") or ""):
+    if is_voided(row) or NO_LOT_NEEDED.search(row.get("measurement") or ""):
         return False
     if not (row.get("lot") or "").strip():
         return True
@@ -1982,7 +1991,8 @@ DASH = {"out_dir": None, "station": "", "port": 8080, "support": "your superviso
 
 
 def summarize_rows(rows):
-    """One summary row per lot (same rules as Lot_Summary.csv)."""
+    """One summary row per lot (same rules as Lot_Summary.csv). Voided results are left out."""
+    rows = [r for r in rows if not is_voided(r)]
     lots = {}
     for r in rows:
         lot = (r.get("lot") or "").strip() or "(no lot)"
@@ -2030,13 +2040,46 @@ def load_assignments():
     return out
 
 
+VOID_REASONS = ["Wrong sample", "Test run by mistake", "Instrument problem", "Duplicate", "Other"]
+VOID_RULES = {"operator_minutes": 30}
+_VOID_CACHE = {"key": None, "map": {}}
+
+
+def voids_path():
+    return SHARED.folder / "Voids.csv" if SHARED.folder else None
+
+
+def load_voids():
+    """record_id -> latest void/undo entry. Voids.csv is only ever added to."""
+    f = voids_path()
+    if not f or not f.exists():
+        return {}
+    st = f.stat()
+    key = (st.st_mtime_ns, st.st_size)
+    if _VOID_CACHE["key"] == key:
+        return _VOID_CACHE["map"]
+    out = {}
+    try:
+        with open(f, newline="", encoding="utf-8-sig") as fh:
+            for v in csv.DictReader(fh):
+                out[v.get("record_id", "")] = v
+    except Exception:
+        return _VOID_CACHE["map"]
+    _VOID_CACHE.update(key=key, map=out)
+    return out
+
+
+def is_voided(row):
+    return (row.get("voided") or "") == "yes"
+
+
 def read_all_results():
     """All shared results with later lot assignments applied. Re-read only when files change.
     The saved files themselves are never edited."""
     if not SHARED.enabled or not SHARED.folder:
         return []
     files = sorted(SHARED.folder.glob("All_Results_*.csv"))
-    extra = [SHARED.folder / "Lot_Assignments.csv"]
+    extra = [SHARED.folder / "Lot_Assignments.csv", SHARED.folder / "Voids.csv"]
     key = tuple((f.name, f.stat().st_mtime_ns, f.stat().st_size) for f in files + extra if f.exists())
     if key == _ALL_CACHE["key"]:
         return _ALL_CACHE["rows"]
@@ -2061,6 +2104,13 @@ def read_all_results():
             r["lot_assigned_later"] = "yes"
             r["assigned_by"] = a.get("assigned_by", "")
             r["assigned_at"] = a.get("assigned_at", "")
+    voids = load_voids()
+    for r in rows:
+        v = voids.get(r.get("record_id"))
+        if v and v.get("action") == "void":
+            r.update(voided="yes", void_reason=v.get("reason", ""), voided_by=v.get("by", ""), voided_at=v.get("when", ""))
+        elif not v and str(r.get("void", "")).lower() == "true" and r.get("skala_reading_id"):
+            r.update(voided="yes", void_reason="Voided in SKALA", voided_by="SKALA", voided_at="")
     _ALL_CACHE.update(key=key, rows=rows)
     return rows
 
@@ -2078,7 +2128,7 @@ def load_upload_state():
 
 def pending_count():
     last = load_upload_state().get("last_upload", "")
-    return sum(1 for r in read_all_results() if (r.get("logged_at") or "") > last)
+    return sum(1 for r in read_all_results() if (r.get("logged_at") or "") > last and not is_voided(r))
 
 
 def select_rows(scope, lot="", date_from="", date_to=""):
@@ -2108,8 +2158,16 @@ def build_upload_workbook(rows, path):
     cols = SHARED.columns
     ws2.append(cols)
     for r in rows:
-        ws2.append([r.get(c, "") for c in cols])
-    for sheet in (ws, ws2):
+        if not is_voided(r):
+            ws2.append([r.get(c, "") for c in cols])
+    voided = [r for r in rows if is_voided(r)]
+    if voided:     # kept for the record, apart from the results
+        ws3 = wb.create_sheet("Voided")
+        vcols = ["void_reason", "voided_by", "voided_at"] + cols
+        ws3.append(vcols)
+        for r in voided:
+            ws3.append([r.get(c, "") for c in vcols])
+    for sheet in wb.worksheets:
         for c in sheet[1]:
             c.font = Font(name="Arial", bold=True)
         sheet.freeze_panes = "A2"
@@ -2139,6 +2197,11 @@ def do_upload(req):
         x = tmp / f"Lab_Results_{stamp}_{label}.xlsx"
         build_upload_workbook(rows, x)
         files.append((x, x.name))
+    if "detail" in include:
+        for extra_f in ("Voids.csv", "Lot_Assignments.csv"):
+            ef = SHARED.folder / extra_f
+            if ef.exists():
+                files.append((ef, f"Shared/{extra_f}"))
     for sub in [p for p in out_dir.iterdir() if p.is_dir() and p.name not in ("Shared", "Excel", "History")
                 and not p.name.endswith("Exports")] if include & {"detail", "raw"} else []:
         for f in sub.glob("*.csv"):
@@ -2182,6 +2245,75 @@ def do_upload(req):
     return {"ok": True, "results": len(rows), "files": len(files), "where": where}, sent
 
 
+def void_result(record_id, action, by, reason="", pin=""):
+    """Mark a result as void (or undo it). Nothing is deleted: the action is added to Voids.csv."""
+    by = (by or "").strip()
+    if not by:
+        raise ValueError("Enter your name.")
+    ops = LOT_RULES.get("operators") or []
+    if ops and by not in ops:
+        raise ValueError("Choose your name from the list.")
+    row = next((r for r in read_all_results() if r.get("record_id") == record_id), None)
+    if not row:
+        raise ValueError("That result wasn't found.")
+    if action == "void":
+        if is_voided(row):
+            raise ValueError("That result is already voided.")
+        reason = (reason or "").strip()
+        if not reason or reason == "Other":
+            raise ValueError("Give a reason for voiding it.")
+    elif action == "unvoid":
+        if not is_voided(row):
+            raise ValueError("That result isn't voided.")
+        if row.get("voided_by") == "SKALA":
+            raise ValueError("This reading was voided in SKALA. Undo it in SKALA instead.")
+    else:
+        raise ValueError("Unknown action.")
+    # who may do it: the person who ran it, soon after; otherwise a supervisor with the support PIN
+    pin_set = str(DASH.get("support_pin") or "")
+    minutes = float(VOID_RULES.get("operator_minutes", 30))
+    try:
+        age_min = (dt.datetime.now() - dt.datetime.fromisoformat(row.get("logged_at", ""))).total_seconds() / 60
+    except ValueError:
+        age_min = 1e9
+    own = not (row.get("operator") or "").strip() or (row.get("operator") or "").strip().lower() == by.lower()
+    with_pin = bool(pin_set) and str(pin) == pin_set
+    if pin_set and not with_pin and not (own and age_min <= minutes):
+        why = (f"it was saved more than {minutes:g} minutes ago" if own else f"it was run by {row.get('operator')}")
+        raise PermissionError(f"A supervisor needs to do this with the support PIN, because {why}.")
+    entry = {"when": now_iso(), "record_id": record_id, "action": action, "reason": reason if action == "void" else "",
+             "by": by, "with_pin": "yes" if with_pin else "no", "instrument": row.get("instrument", ""),
+             "measurement": row.get("measurement", ""), "value": row.get("value", ""), "unit": row.get("unit", ""),
+             "lot": row.get("lot", ""), "result_saved_at": row.get("logged_at", "")}
+    WRITER.append(voids_path(), [entry])
+    WRITER.flush()
+    SHARED.dirty = True
+    EXCEL.mark(row.get("_month"))
+    EXCEL.mark()
+    log(f"{'Voided' if action == 'void' else 'Un-voided'} {row.get('instrument')} {row.get('measurement')} "
+        f"{row.get('value')} {row.get('unit')} (lot '{row.get('lot')}') by {by}" + (f": {reason}" if action == "void" else ""))
+    return entry
+
+
+def annotate_voids(items):
+    voids = load_voids()
+    rows_by_id = None
+    out = []
+    for it in items:
+        it = dict(it)
+        v = voids.get(it.get("record_id"))
+        if v and v.get("action") == "void":
+            it.update(voided=True, void_reason=v.get("reason", ""), voided_by=v.get("by", ""))
+        elif not v and it.get("record_id", "").startswith("AQUALAB"):
+            if rows_by_id is None:
+                rows_by_id = {r.get("record_id"): r for r in read_all_results()}
+            r = rows_by_id.get(it.get("record_id"))
+            if r and is_voided(r):
+                it.update(voided=True, void_reason=r.get("void_reason", ""), voided_by="SKALA")
+        out.append(it)
+    return out
+
+
 def dashboard_state():
     with DEV_LOCK:
         devices = []
@@ -2191,12 +2323,16 @@ def dashboard_state():
             item["live_active"] = bool(lv and lv.get("test") and lv["test"].get("active"))
             devices.append(item)
         recent = list(RECENT)[:25]
+    recent = annotate_voids(recent)
+    with DEV_LOCK:
         ctx = dict(CONTEXT)
     needs = results_needing_lot()
     return {"station": DASH["station"], "support": DASH["support"], "context": ctx,
             "expires_at": context_expires_at(), "needs_lot": needs[-50:], "needs_lot_count": len(needs),
             "operators": LOT_RULES.get("operators") or [], "lot_example": LOT_RULES.get("lot_example", ""),
             "block_upload": bool(LOT_RULES.get("block_upload_without_lot", True)),
+            "void_reasons": VOID_REASONS, "void_minutes": VOID_RULES.get("operator_minutes", 30),
+            "pin_set": bool(DASH.get("support_pin")),
             "excel": {"file": EXCEL.path().name if EXCEL.folder else "", "updated_at": EXCEL.updated_at,
                       "locked": EXCEL.locked},
             "backup": HISTORY.last,
@@ -2254,7 +2390,8 @@ def latest_full_result(name):
     if shared and (not detail or shared.get("logged_at") == merged.get("logged_at")
                    or shared.get("record_id") == merged.get("record_id")):
         for k in ("lot", "operator", "note", "measurement", "value", "unit", "lot_assigned_later",
-                  "assigned_by", "assigned_at", "std_L*", "std_a*", "std_b*"):
+                  "assigned_by", "assigned_at", "std_L*", "std_a*", "std_b*", "record_id",
+                  "voided", "void_reason", "voided_by", "voided_at"):
             if shared.get(k):
                 merged[k] = shared[k]
     elif shared and not detail:
@@ -2269,7 +2406,7 @@ def device_state(name):
         lines = list(lv.get("lines") or [])[-60:]
         test = json.loads(json.dumps(lv.get("test"))) if lv.get("test") else None
         results = [r for r in RECENT if r["instrument"] == name][:30]
-    return {"device": d, "lines": lines, "test": test, "results": results, "latest": latest_full_result(name)}
+    return {"device": d, "lines": lines, "test": test, "results": annotate_voids(results), "latest": latest_full_result(name)}
 
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -2390,7 +2527,7 @@ function homeShell(){
     <section class="card" aria-label="Recent results"><div class="hd"><h2>Recent results</h2>
         <div class="row" style="flex-wrap:wrap;justify-content:flex-end"><span id="excelInfo" class="muted" style="font-size:13px"></span>
         <button class="btn" type="button" id="openExcel">Open in Excel</button></div></div>
-      <div class="scroll"><table><thead><tr><th>Time</th><th>Lot</th><th>Instrument</th><th>Measurement</th><th class="r">Value</th><th>Operator</th></tr></thead><tbody id="recentBody"></tbody></table></div></section>
+      <div class="scroll"><table><thead><tr><th>Time</th><th>Lot</th><th>Instrument</th><th>Measurement</th><th class="r">Value</th><th>Operator</th><th><span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">Mistake?</span></th></tr></thead><tbody id="recentBody"></tbody></table></div></section>
     <p style="margin:0;text-align:center;font-size:13px"><a href="#support" class="muted">Support page (setup and fault-finding)</a></p>
   </main>`;
 }
@@ -2481,9 +2618,10 @@ function updateHome(){
       <div class="foot"><span>${r ? 'Last result ' + esc(hhmm(r.time)) + (r.lot ? ' · ' + esc(r.lot) : '') : 'No results yet'}</span><span style="color:var(--accent);font-weight:500">Open →</span></div></a>`;
   }).join(''));
   const labelOf = n => (S.devices.find(x => x.name === n) || {}).label || n;
-  setIfChanged('#recentBody', S.recent.map(r => `<tr><td class="m muted">${esc(hhmm(r.time))}</td><td class="m">${esc(r.lot||'—')}</td><td>${esc(labelOf(r.instrument))}</td>
-     <td>${esc(r.measurement)}</td><td class="r"><b style="font-weight:500">${esc(r.value)}</b> <span class="muted">${esc(r.unit)}</span></td><td>${esc(r.operator)}</td></tr>`).join('')
-     || '<tr><td colspan="6" class="muted" style="padding:20px">No results yet today. They appear here by themselves as soon as an instrument finishes a test.</td></tr>');
+  setIfChanged('#recentBody', S.recent.map(r => { const x = r.voided ? 'text-decoration:line-through;color:var(--muted)' : '';
+     return `<tr${r.voided ? ' title="Voided: ' + esc(r.void_reason) + '"' : ''}><td class="m muted" style="${x}">${esc(hhmm(r.time))}</td><td class="m" style="${x}">${esc(r.lot||'—')}</td><td style="${x}">${esc(labelOf(r.instrument))}</td>
+     <td style="${x}">${esc(r.measurement)}${voidTag(r)}</td><td class="r" style="${x}"><b style="font-weight:500">${esc(r.value)}</b> <span class="muted">${esc(r.unit)}</span></td><td style="${x}">${esc(r.operator)}</td><td>${voidCell(r)}</td></tr>`; }).join('')
+     || '<tr><td colspan="7" class="muted" style="padding:20px">No results yet today. They appear here by themselves as soon as an instrument finishes a test.</td></tr>');
 }
 
 function secs(mmss){ const [m,s] = String(mmss).split(':').map(Number); return (m||0)*60 + (s||0); }
@@ -2567,6 +2705,7 @@ function latestPanel(d, r){
   const grid = list => `<dl class="kv" style="margin:0;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));flex:none">${list.map(([k, v]) =>
       `<div><dt style="font-size:12px;color:var(--muted)">${esc(k)}</dt><dd style="margin:0;font-family:var(--sans);font-size:16px;word-break:break-word">${esc(v)}</dd></div>`).join('')}</dl>`;
   return `<div class="row" style="flex-wrap:wrap"><h2>Latest result</h2><span class="muted" style="font-size:13px">${esc(r.measurement || '')}</span></div>
+    ${r.voided === 'yes' ? `<div class="msg err" style="font-size:15px"><b>Voided</b>: ${esc(r.void_reason)}${r.voided_by ? ' · by ' + esc(r.voided_by) : ''}${r.voided_at ? ' · ' + esc(when2(r.voided_at)) : ''}. Left out of the Lot Summary.</div>` : ''}
     ${headline(d.type, r)}
     ${pairs.length ? grid(pairs) : ''}
     <div style="border-top:1px solid var(--line2);padding-top:14px">${grid(run)}</div>`;
@@ -2592,8 +2731,10 @@ function viewDevice(name){
   const lines = D.lines.length ? esc(D.lines.map(l => l[1]).join('\n')) : '';
   const feed = (d.type === 'mb90' || d.type === 'ph')
     ? `<details ${S._openFeed ? 'open' : ''} id="feedBox"><summary style="cursor:pointer;min-height:44px;display:flex;align-items:center;font-size:14px;color:var(--muted)">Show what the instrument printed</summary>${lines ? '<pre id="feed" data-keep="feed">' + lines + '</pre>' : '<p class="muted" style="margin:0">Nothing received yet.</p>'}</details>` : '';
-  const results = D.results.map(r => `<div><div style="display:flex;flex-direction:column;gap:2px"><span style="font-size:14px;font-weight:500">${esc(r.measurement)}</span>
-      <span class="muted" style="font-size:13px">${esc(hhmm(r.time))} · ${esc(r.lot||'no lot')}</span></div><span style="font-family:var(--mono);font-weight:500">${esc(r.value)} ${esc(r.unit)}</span></div>`).join('')
+  const results = D.results.map(r => { const x = r.voided ? 'text-decoration:line-through;color:var(--muted)' : '';
+      return `<div style="align-items:center"><div style="display:flex;flex-direction:column;gap:2px"><span style="font-size:14px;font-weight:500;${x}">${esc(r.measurement)}${voidTag(r)}</span>
+      <span class="muted" style="font-size:13px">${esc(hhmm(r.time))} · ${esc(r.lot||'no lot')}${r.voided ? ' · ' + esc(r.void_reason) : ''}</span></div>
+      <div style="display:flex;align-items:center;gap:8px"><span style="font-family:var(--mono);font-weight:500;${x}">${esc(r.value)} ${esc(r.unit)}</span>${voidCell(r)}</div></div>`; }).join('')
       || '<div><span class="muted">No results yet</span></div>';
   const skala = d.type === 'skala_api' ? '<a class="btn primary" href="https://skalacontrol.io" target="_blank" rel="noopener">Open SKALA</a><button class="btn" id="sync" type="button">Check SKALA now</button>'
               : (d.type === 'colorimeter_folder' || d.type === 'export_folder') ? '<button class="btn" id="openFolder" type="button">Open the export folder</button><span id="folderMsg" class="muted" style="font-size:13px"></span>' : '';
@@ -2962,6 +3103,75 @@ function renderConnect(){
   $('#app').innerHTML = header(`<div class="row" style="justify-content:flex-start;gap:16px"><a class="back" href="#">${icon.back} All instruments</a><b style="font-size:20px">Connect SKALA</b></div>`)
     + `<main><section class="card pad" style="gap:16px;max-width:720px">${body}</section></main>`;
 }
+// ---------------- Void / undo void ----------------
+function voidCell(r){
+  if(!r.record_id) return '';
+  return r.voided
+    ? `<button class="btn" type="button" data-unvoid="${esc(r.record_id)}" style="min-height:34px;padding:0 10px;font-size:13px">Undo void</button>`
+    : `<button class="btn" type="button" data-void="${esc(r.record_id)}" style="min-height:34px;padding:0 10px;font-size:13px;color:var(--muted)">Void</button>`;
+}
+function voidTag(r){ return r.voided ? `<span style="display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;background:var(--badHalo);color:var(--badInk);font-size:12px;font-weight:600;text-decoration:none" title="${esc(r.void_reason)}">VOID</span>` : ''; }
+let voidTarget = null;
+function voidDialog(){
+  let dlg = document.getElementById('voidDlg');
+  if(dlg) return dlg;
+  dlg = document.createElement('dialog'); dlg.id = 'voidDlg';
+  dlg.style.cssText = 'border:1px solid var(--line);border-radius:12px;padding:0;max-width:520px;width:calc(100% - 32px);font-family:var(--sans);color:var(--ink)';
+  document.body.appendChild(dlg);
+  dlg.addEventListener('click', e => { if(e.target === dlg) dlg.close(); });
+  return dlg;
+}
+function openVoid(rec, action){
+  voidTarget = {rec, action};
+  const dlg = voidDialog(), c = S.context;
+  const what = `${esc(rec.measurement)} <b style="font-family:var(--mono);font-weight:500">${esc(rec.value)} ${esc(rec.unit)}</b> · ${esc(rec.instrument_label || rec.instrument)} · ${esc(hhmm(rec.time))} · lot ${esc(rec.lot || '—')}`;
+  const nameField = S.operators && S.operators.length
+    ? `<select id="vBy" style="width:100%"><option value="">Choose your name</option>${S.operators.map(o => `<option ${o === c.operator ? 'selected' : ''}>${esc(o)}</option>`).join('')}</select>`
+    : `<input type="text" id="vBy" value="${esc(c.operator || '')}" placeholder="Your name" style="width:100%">`;
+  dlg.innerHTML = `<form method="dialog" id="vForm" style="display:flex;flex-direction:column;gap:16px;padding:24px">
+    <h2 style="margin:0">${action === 'void' ? 'Void this result?' : 'Undo the void?'}</h2>
+    <p style="margin:0;font-size:15px;line-height:1.5">${what}</p>
+    ${action === 'void' ? `<p class="muted" style="margin:0;font-size:14px">The result stays in the records, marked VOID with your reason. It's left out of the Lot Summary and uploads. It can be undone.</p>
+    <fieldset><legend style="font-size:15px">Why?</legend>
+      ${S.void_reasons.map((r, i) => `<label class="opt"><input type="radio" name="vReason" value="${esc(r)}" ${i === 0 ? '' : ''}> ${esc(r)}</label>`).join('')}
+      <input type="text" id="vOther" placeholder="Describe the reason" style="display:none;margin-top:4px"></fieldset>`
+    : `<p class="muted" style="margin:0;font-size:14px">Voided because: ${esc(rec.void_reason || '—')}${rec.voided_by ? ' (by ' + esc(rec.voided_by) + ')' : ''}. Undoing puts it back in the Lot Summary.</p>`}
+    <div class="field"><label for="vBy">Your name</label>${nameField}</div>
+    <div class="field" id="vPinBox" style="display:none"><label for="vPin">Supervisor PIN</label><input type="password" id="vPin" autocomplete="off" style="width:200px"></div>
+    <div id="vMsg" style="font-size:14px"></div>
+    <div class="row" style="justify-content:flex-end;gap:10px"><button class="btn" type="button" id="vCancel">Cancel</button>
+      <button class="btn ${action === 'void' ? 'dark' : 'primary'}" type="submit">${action === 'void' ? 'Void result' : 'Undo void'}</button></div></form>`;
+  dlg.querySelector('#vCancel').onclick = () => dlg.close();
+  dlg.querySelectorAll('input[name=vReason]').forEach(x => x.onchange = () => { dlg.querySelector('#vOther').style.display = x.value === 'Other' && x.checked ? '' : 'none'; });
+  dlg.querySelector('#vForm').onsubmit = async e => {
+    e.preventDefault();
+    const msg = dlg.querySelector('#vMsg');
+    let reason = '';
+    if(action === 'void'){
+      const pick = dlg.querySelector('input[name=vReason]:checked');
+      if(!pick){ msg.innerHTML = '<span style="color:var(--badInk)">Choose a reason.</span>'; return; }
+      reason = pick.value === 'Other' ? 'Other: ' + dlg.querySelector('#vOther').value.trim() : pick.value;
+      if(reason === 'Other: '){ msg.innerHTML = '<span style="color:var(--badInk)">Describe the reason.</span>'; return; }
+    }
+    const j = await (await post(action === 'void' ? '/api/void' : '/api/unvoid',
+      {record_id: rec.record_id, reason, by: dlg.querySelector('#vBy').value.trim(), pin: dlg.querySelector('#vPin').value})).json();
+    if(j.ok){ dlg.close(); lastDeviceHtml = ''; await refresh(); return; }
+    if(j.pin_needed) dlg.querySelector('#vPinBox').style.display = '';
+    msg.innerHTML = `<span style="color:var(--badInk)">${esc(j.error)}</span>`;
+  };
+  dlg.showModal();
+}
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-void],[data-unvoid]');
+  if(!b) return;
+  e.preventDefault(); e.stopPropagation();
+  const id = b.dataset.void || b.dataset.unvoid;
+  const pool = [...(S ? S.recent : []), ...((D && D.results) || [])];
+  const rec = pool.find(r => r.record_id === id);
+  if(!rec) return;
+  rec.instrument_label = ((S.devices || []).find(x => x.name === rec.instrument) || {}).label;
+  openVoid(rec, b.dataset.void ? 'void' : 'unvoid');
+});
 async function refresh(){
   try {
     const keep = S && S._openFeed; S = await (await fetch('/api/state')).json(); S._openFeed = keep;
@@ -3052,6 +3262,15 @@ def start_dashboard(cfg, out_dir):
                                    set_at=now_iso())
                 log(f"Dashboard: lot='{lot}' operator='{operator}' note='{CONTEXT['note']}'")
                 return self._json({"ok": True, "context": dict(CONTEXT)})
+            if path in ("/api/void", "/api/unvoid"):
+                try:
+                    entry = void_result(str(body.get("record_id", "")), "void" if path == "/api/void" else "unvoid",
+                                        str(body.get("by", "")), str(body.get("reason", "")), str(body.get("pin", "")))
+                except PermissionError as e:
+                    return self._json({"ok": False, "error": str(e), "pin_needed": True}, 403)
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                return self._json({"ok": True, "entry": entry})
             if path == "/api/assign":
                 try:
                     n = assign_lot(body.get("record_ids") or [], str(body.get("lot", "")).strip(),
