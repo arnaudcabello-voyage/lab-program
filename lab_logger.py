@@ -2274,11 +2274,11 @@ fieldset{margin:0;padding:0;border:0;display:flex;flex-direction:column;gap:6px}
 <script>
 const $ = (s, el=document) => el.querySelector(s);
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let S = null, D = null, uploadMsg = '';
+let S = null, D = null, uploadMsg = '', lastDeviceHtml = '';
 const post = (path, body) => fetch(path, {method:'POST', headers:{'Content-Type':'application/json','X-Lab-Logger':'1'}, body: JSON.stringify(body||{})});
 const hhmm = t => t ? String(t).slice(11,16) : '';
 const ago = t => { if(!t) return 'never'; const s = Math.round((Date.now() - new Date(t).getTime())/1000);
-  return s < 60 ? s + ' s ago' : s < 3600 ? Math.round(s/60) + ' min ago' : hhmm(t); };
+  return s < 10 ? 'just now' : s < 60 ? 'under a minute ago' : s < 3600 ? Math.round(s/60) + ' min ago' : hhmm(t); };
 const statusHtml = d => d.ok ? '<span class="status ok"><span class="dot" aria-hidden="true"></span>Connected</span>'
                             : '<span class="status bad"><span class="dot" aria-hidden="true"></span>Not connected</span>';
 // What an operator should read for each instrument, in plain words.
@@ -2383,6 +2383,7 @@ function renderNeeds(){
     if(j.ok) setTimeout(() => { needsMsg = ''; needsKey = null; renderNeeds(); }, 4000);
   };
 }
+function setIfChanged(sel, html){ const el = $(sel); if(el && el.dataset.html !== html){ el.innerHTML = html; el.dataset.html = html; } }
 function updateHome(){
   const c = S.context;
   $('#pending').textContent = pendingText();
@@ -2415,18 +2416,18 @@ function updateHome(){
   }
   $('#banner').innerHTML = (!c.lot || !c.operator)
     ? `<div class="msg err" role="status" style="font-size:15px"><b>Before testing:</b> enter the lot number and your name, then press Save. Results that finish before then will need a lot assigned.</div>` : '';
-  $('#cards').innerHTML = S.devices.map(d => {
+  setIfChanged('#cards', S.devices.map(d => {
     const r = d.last_result;
     return `<a class="card dev" href="#device/${encodeURIComponent(d.name)}">
       <div class="row"><span style="font-size:16px;font-weight:600">${esc(d.label)}</span>${statusHtml(d)}</div>
       <div class="muted" style="font-size:13px" title="${esc(d.detail)}">${esc(plain(d).short)}${d.live_active ? ' · <b style="color:var(--warnInk)">test running</b>' : ''}</div>
       <div style="display:flex;align-items:baseline;gap:8px"><span class="big">${r ? esc(r.value) : '—'}</span><span class="muted">${r ? esc(r.unit) : ''}</span></div>
       <div class="foot"><span>${r ? 'Last result ' + esc(hhmm(r.time)) + (r.lot ? ' · ' + esc(r.lot) : '') : 'No results yet'}</span><span style="color:var(--accent);font-weight:500">Open →</span></div></a>`;
-  }).join('');
+  }).join(''));
   const labelOf = n => (S.devices.find(x => x.name === n) || {}).label || n;
-  $('#recentBody').innerHTML = S.recent.map(r => `<tr><td class="m muted">${esc(hhmm(r.time))}</td><td class="m">${esc(r.lot||'—')}</td><td>${esc(labelOf(r.instrument))}</td>
+  setIfChanged('#recentBody', S.recent.map(r => `<tr><td class="m muted">${esc(hhmm(r.time))}</td><td class="m">${esc(r.lot||'—')}</td><td>${esc(labelOf(r.instrument))}</td>
      <td>${esc(r.measurement)}</td><td class="r"><b style="font-weight:500">${esc(r.value)}</b> <span class="muted">${esc(r.unit)}</span></td><td>${esc(r.operator)}</td></tr>`).join('')
-     || '<tr><td colspan="6" class="muted" style="padding:20px">No results yet today. They appear here by themselves as soon as an instrument finishes a test.</td></tr>';
+     || '<tr><td colspan="6" class="muted" style="padding:20px">No results yet today. They appear here by themselves as soon as an instrument finishes a test.</td></tr>');
 }
 
 function secs(mmss){ const [m,s] = String(mmss).split(':').map(Number); return (m||0)*60 + (s||0); }
@@ -2466,7 +2467,7 @@ function viewDevice(name){
   }
   const lines = D.lines.length ? esc(D.lines.map(l => l[1]).join('\n')) : '';
   const feed = (d.type === 'mb90' || d.type === 'ph')
-    ? `<details ${S._openFeed ? 'open' : ''} id="feedBox"><summary style="cursor:pointer;min-height:44px;display:flex;align-items:center;font-size:14px;color:var(--muted)">Show what the instrument printed</summary>${lines ? '<pre id="feed">' + lines + '</pre>' : '<p class="muted" style="margin:0">Nothing received yet.</p>'}</details>` : '';
+    ? `<details ${S._openFeed ? 'open' : ''} id="feedBox"><summary style="cursor:pointer;min-height:44px;display:flex;align-items:center;font-size:14px;color:var(--muted)">Show what the instrument printed</summary>${lines ? '<pre id="feed" data-keep="feed">' + lines + '</pre>' : '<p class="muted" style="margin:0">Nothing received yet.</p>'}</details>` : '';
   const results = D.results.map(r => `<div><div style="display:flex;flex-direction:column;gap:2px"><span style="font-size:14px;font-weight:500">${esc(r.measurement)}</span>
       <span class="muted" style="font-size:13px">${esc(hhmm(r.time))} · ${esc(r.lot||'no lot')}</span></div><span style="font-family:var(--mono);font-weight:500">${esc(r.value)} ${esc(r.unit)}</span></div>`).join('')
       || '<div><span class="muted">No results yet</span></div>';
@@ -2539,11 +2540,25 @@ function render(){
     updateSupport();
     return;
   }
-  const openIds = [...document.querySelectorAll('details[open]')].map(x => x.id).filter(Boolean);
-  if(h.startsWith('device/')) app.innerHTML = viewDevice(decodeURIComponent(h.slice(7)));
+  if(h.startsWith('device/')){
+    // Redraw only when something on the page changed, and put every scrollable area back
+    // where it was, so scrolling sideways or up doesn't jump back.
+    const html = viewDevice(decodeURIComponent(h.slice(7)));
+    if(html === lastDeviceHtml) return;
+    const openIds = [...document.querySelectorAll('details[open]')].map(x => x.id).filter(Boolean);
+    const kept = [...app.querySelectorAll('[data-keep]')].map(el => [el.dataset.keep, el.scrollLeft, el.scrollTop,
+      el.scrollHeight - el.scrollTop - el.clientHeight < 30]);
+    const pageY = window.scrollY, firstDraw = !lastDeviceHtml;
+    app.innerHTML = html; lastDeviceHtml = html;
+    openIds.forEach(id => { const x = document.getElementById(id); if(x) x.open = true; });
+    for(const [k, left, top, atEnd] of kept){
+      const el = app.querySelector(`[data-keep="${k}"]`);
+      if(el){ el.scrollLeft = left; el.scrollTop = (k === 'feed' && atEnd) ? el.scrollHeight : top; }
+    }
+    const feed = $('#feed'); if(feed && (firstDraw || !kept.some(x => x[0] === 'feed'))) feed.scrollTop = feed.scrollHeight;
+    window.scrollTo(window.scrollX, pageY);
+  }
   else if(h === 'upload') { if(!$('#up')) app.innerHTML = viewUpload(); }
-  openIds.forEach(id => { const x = document.getElementById(id); if(x) x.open = true; });
-  const feed = $('#feed'); if(feed) feed.scrollTop = feed.scrollHeight;
   const fb = $('#feedBox'); if(fb) fb.ontoggle = () => { S._openFeed = fb.open; };
   bind();
 }
@@ -2830,7 +2845,7 @@ async function refresh(){
     render();
   } catch(e){ $('#app').innerHTML = '<main><div class="card pad"><h2>Lab Logger isn\'t running</h2><p style="margin:0;font-size:15px">Double-click the <b>Lab Logger</b> icon on the desktop. This page comes back by itself.</p></div></main>'; }
 }
-window.addEventListener('hashchange', () => { uploadMsg = ''; D = null; needsKey = null; needsMsg = ''; $('#app').innerHTML = ''; refresh(); });
+window.addEventListener('hashchange', () => { uploadMsg = ''; D = null; needsKey = null; needsMsg = ''; lastDeviceHtml = ''; $('#app').innerHTML = ''; refresh(); });
 refresh(); setInterval(refresh, 2000);
 </script>
 </body>
