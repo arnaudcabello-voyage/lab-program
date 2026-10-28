@@ -1,0 +1,72 @@
+{
+  "_help": "Edit this file, save it, then restart Lab Logger (Stop Lab Logger, then Lab Logger). Use forward slashes in paths.",
+  "station_name": "Bench 1",
+  "output_folder": "C:/LabLogger/data",
+  "shared_file": {
+    "enabled": true,
+    "aqualab_lot_from": "batch_name"
+  },
+  "dashboard": {
+    "enabled": true,
+    "port": 8080,
+    "open_browser": true,
+    "support_contact": "your supervisor",
+    "support_pin": ""
+  },
+  "upload": {
+    "folder": ""
+  },
+  "history": {
+    "enabled": true,
+    "keep_days": 0
+  },
+  "lot_rules": {
+    "expire_minutes": 120,
+    "clear_at_midnight": true,
+    "lot_pattern": "",
+    "lot_example": "",
+    "operators": [],
+    "block_upload_without_lot": true
+  },
+  "instruments": [
+    {
+      "name": "MB90",
+      "type": "mb90",
+      "enabled": true,
+      "port": "COM6",
+      "baudrate": 9600,
+      "bytesize": 8,
+      "parity": "N",
+      "stopbits": 1,
+      "xonxoff": false
+    },
+    {
+      "name": "pH_meter",
+      "type": "ph",
+      "enabled": true,
+      "port": "COM3",
+      "baudrate": 9600,
+      "bytesize": 8,
+      "parity": "N",
+      "stopbits": 1,
+      "xonxoff": false
+    },
+    {
+      "name": "LS177C",
+      "type": "colorimeter_folder",
+      "enabled": true,
+      "watch_folder": "C:/LabLogger/data/Colorimeter Exports",
+      "poll_seconds": 10,
+      "skip_duplicates": true
+    },
+    {
+      "name": "AQUALAB3",
+      "type": "skala_api",
+      "enabled": true,
+      "token_file": "C:/LabLogger/skala_token.txt",
+      "sbs_serial": "SKM16F64",
+      "poll_minutes": 5,
+      "lookback_days": 3
+    }
+  ]
+}

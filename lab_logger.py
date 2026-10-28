@@ -60,6 +60,11 @@ except ImportError:
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+try:
+    import hashlib as _hl
+    VERSION = _hl.sha1(Path(__file__).read_bytes()).hexdigest()[:12]
+except Exception:
+    VERSION = "unknown"
 CONFIG_PATH = SCRIPT_DIR / "lab_logger_config.json"
 
 DEFAULT_CONFIG = {
@@ -69,7 +74,7 @@ DEFAULT_CONFIG = {
     "output_folder": (SCRIPT_DIR / "data").as_posix(),
     "shared_file": {"enabled": True, "aqualab_lot_from": "batch_name"},
     "dashboard": {"enabled": True, "port": 8080, "open_browser": True,
-                  "support_contact": "your supervisor"},
+                  "support_contact": "your supervisor", "support_pin": ""},
     "upload": {"folder": ""},
     "history": {"enabled": True, "keep_days": 0},
     "lot_rules": {"expire_minutes": 120, "clear_at_midnight": True, "lot_pattern": "", "lot_example": "",
@@ -130,6 +135,8 @@ from collections import deque
 DEVICES = {}          # name -> {"type","label","ok","detail","last_data","last_result"}
 LIVE = {}             # name -> {"lines": deque, "test": {...}}
 RECENT = deque(maxlen=300)   # newest shared results, for the dashboard
+INSTRUMENTS = {}      # name -> running instrument object (for the Support page)
+LOG_TAIL = deque(maxlen=200)  # recent log lines, shown on the Support page
 DEV_LOCK = threading.Lock()
 DEVICE_LABELS = {"mb90": "MB90 moisture", "ph": "pH meter",
                  "colorimeter_folder": "LS177C color", "export_folder": "AQUALAB 3",
@@ -176,6 +183,10 @@ def write_log_file(msg):
 
 def log(msg):
     line = f"[{dt.datetime.now():%H:%M:%S}] {msg}"
+    try:
+        LOG_TAIL.append(line)
+    except NameError:
+        pass
     if sys.stdout is not None:
         try:
             print(line, flush=True)
@@ -389,7 +400,10 @@ def parse_ph(text):
 class SerialInstrument(threading.Thread):
     START_MARKERS = {"ph": re.compile(r"\bA?-?AB(33|41)", re.I)}
     END_MARKERS = {"mb90": re.compile(r"-{3,}\s*END\s*-{3,}", re.I)}
-    IDLE_FLUSH = {"mb90": 900.0, "ph": 2.5}   # seconds of silence before a record is closed
+    IDLE_FLUSH = {"mb90": 4.0, "ph": 2.5}   # seconds of silence before a printout is saved
+    # While an MB90 test or calibration is printing, readings can be minutes apart,
+    # so wait for its END line (or 15 minutes of silence) before saving.
+    MB90_IN_PROGRESS = re.compile(r"MOISTURE DETERMINATION|ADJUST|STATISTICS", re.I)
 
     def __init__(self, cfg, out_dir):
         super().__init__(daemon=True)
@@ -399,7 +413,14 @@ class SerialInstrument(threading.Thread):
         self.out_dir = out_dir
         self.buffer = []
         self.last_rx = 0.0
-        set_status(self.name_, "starting", False, type=self.kind,
+        self.reopen = False
+        self.wake = threading.Event()
+        self.port_obj = None
+        self.probe = None
+        self.diag = {"port": cfg.get("port", ""), "open": False, "bytes": 0, "lines": 0, "records": 0,
+                     "last_line": "", "last_data": "", "last_error": "", "opened_at": ""}
+        INSTRUMENTS[self.name_] = self
+        set_status(self.name_, "starting", False, type=self.kind, diag=self.diag,
                    label=cfg.get("label") or DEVICE_LABELS.get(self.kind, self.name_))
 
     def open_port(self):
@@ -415,17 +436,40 @@ class SerialInstrument(threading.Thread):
             timeout=0.5,
         )
 
+    def reconfigure(self, new_cfg):
+        """Use new port settings straight away (from the Support page)."""
+        self.cfg.update(new_cfg)
+        self.diag.update(port=self.cfg.get("port", ""), last_error="")
+        self.reopen = True
+        self.wake.set()
+
+    def ask(self, command, wait=3.0):
+        """Send a query and return the reply lines. Replies never become results."""
+        port = self.port_obj
+        if port is None:
+            raise RuntimeError("The port isn't open, so there's nothing to ask.")
+        self.probe = {"until": time.time() + wait, "lines": []}
+        port.write((command + "\r\n").encode("ascii"))
+        time.sleep(wait)
+        lines, self.probe = self.probe["lines"], None
+        return lines
+
     def run(self):
         while not STOP.is_set():
+            self.reopen = False
             try:
                 with self.open_port() as port:
+                    self.port_obj = port
+                    self.diag.update(open=True, port=self.cfg["port"], opened_at=now_iso(), last_error="")
                     set_status(self.name_, f"USB · {self.cfg['port']}", True)
                     log(f"{self.name_}: connected on {self.cfg['port']}")
                     partial = b""
-                    while not STOP.is_set():
+                    while not STOP.is_set() and not self.reopen:
                         chunk = port.read(512)
                         if chunk:
                             self.last_rx = time.time()
+                            self.diag["bytes"] += len(chunk)
+                            self.diag["last_data"] = now_iso()
                             partial += chunk
                             while b"\n" in partial or b"\r" in partial:
                                 line, partial = re.split(rb"\r\n|\n|\r", partial, maxsplit=1)
@@ -434,7 +478,15 @@ class SerialInstrument(threading.Thread):
                             self.handle_line(self.decode(partial))
                             partial = b""
                         self.check_idle()
+                self.port_obj = None
+                self.diag["open"] = False
+                if self.reopen:
+                    self.flush()
+                    log(f"{self.name_}: reconnecting with new settings ({self.cfg['port']})")
+                    continue
             except Exception as e:  # port missing, unplugged, busy...
+                self.port_obj = None
+                self.diag.update(open=False, last_error=str(e))
                 if STATUS.get(self.name_, "").startswith("USB"):
                     log(f"{self.name_}: connection lost ({e}). Retrying...")
                 elif not STATUS.get(self.name_, "").startswith("Not connected"):
@@ -442,7 +494,8 @@ class SerialInstrument(threading.Thread):
                         f"Will keep retrying every 5 s.")
                 set_status(self.name_, f"Not connected ({self.cfg['port']})", False)
                 self.flush()
-                STOP.wait(5)
+                self.wake.wait(5)
+                self.wake.clear()
 
     @staticmethod
     def decode(b):
@@ -454,6 +507,12 @@ class SerialInstrument(threading.Thread):
     def handle_line(self, line):
         if line.strip():
             live_line(self.name_, line.rstrip())
+            self.diag["lines"] += 1
+            self.diag["last_line"] = line.strip()[:120]
+            self.diag["last_data"] = now_iso()
+            if self.probe and time.time() < self.probe["until"]:
+                self.probe["lines"].append(line.rstrip())   # a reply to a Support-page question
+                return
             if self.kind == "mb90":
                 self.track_mb90(line)
         if not line.strip():
@@ -463,6 +522,8 @@ class SerialInstrument(threading.Thread):
         start = self.START_MARKERS.get(self.kind)
         if start and start.search(line) and any(l.strip() for l in self.buffer):
             self.flush()
+        if not any(l.strip() for l in self.buffer):
+            log(f"{self.name_}: receiving data")
         self.buffer.append(line.rstrip())
         end = self.END_MARKERS.get(self.kind)
         if end and end.search(line):
@@ -496,14 +557,20 @@ class SerialInstrument(threading.Thread):
                 t["active"] = False
                 t["finished"] = now_iso()
 
+    def idle_limit(self):
+        if self.kind == "mb90" and any(self.MB90_IN_PROGRESS.search(l) for l in self.buffer):
+            return 900.0
+        return self.IDLE_FLUSH.get(self.kind, 3.0)
+
     def check_idle(self):
-        if self.buffer and time.time() - self.last_rx > self.IDLE_FLUSH.get(self.kind, 3.0):
+        if self.buffer and time.time() - self.last_rx > self.idle_limit():
             self.flush()
 
     def flush(self):
         text = "\n".join(self.buffer).strip()
         self.buffer = []
         if text:
+            self.diag["records"] += 1
             save_serial_record(self.name_, self.kind, text, self.out_dir)
 
 
@@ -608,7 +675,9 @@ class SharedFile:
         elif rtype == "statistics":
             r.update(measurement="MB90 statistics", value=rec.get("stat_mean"), unit="mean")
         else:
-            r.update(measurement="MB90 printout", value="", unit="")
+            # A Print press outside a test: show any value it printed, but as a printout,
+            # so it isn't counted again as a moisture result in the Lot Summary.
+            r.update(measurement="MB90 printout", value=rec.get("end_result", ""), unit=rec.get("end_result_unit", ""))
         return r
 
     @staticmethod
@@ -734,10 +803,118 @@ def save_serial_record(name, kind, text, out_dir):
 
 
 # --------------------------------------------------------------------------
+# Reading exported spreadsheets: .xlsx, .csv, and every kind of ".xls"
+# --------------------------------------------------------------------------
+def _decode(data):
+    for enc in ("utf-8-sig", "utf-16", "gb18030", "latin-1"):
+        try:
+            text = data.decode(enc)
+            if enc == "utf-16" and not data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+                continue
+            return text
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1", errors="replace")
+
+
+class _TableParser:
+    """Pulls rows out of an HTML table or an Excel 2003 XML file (both are often saved as .xls)."""
+
+    def __init__(self, text):
+        from html.parser import HTMLParser
+        rows, cur, cell = [], None, None
+        tags_row, tags_cell = {"tr", "row"}, {"td", "th", "cell"}
+
+        class P(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                nonlocal cur, cell
+                t = tag.split(":")[-1].lower()
+                if t in tags_row:
+                    cur = []
+                elif t in tags_cell and cur is not None:
+                    cell = []
+                    a = dict((k.split(":")[-1].lower(), v) for k, v in attrs)
+                    idx = a.get("index")          # Excel XML can skip empty cells
+                    if idx and idx.isdigit():
+                        while len(cur) < int(idx) - 1:
+                            cur.append("")
+                    self._span = int(a.get("colspan") or 1) if str(a.get("colspan") or "1").isdigit() else 1
+
+            def handle_endtag(self, tag):
+                nonlocal cur, cell
+                t = tag.split(":")[-1].lower()
+                if t in tags_cell and cur is not None and cell is not None:
+                    cur.append(" ".join("".join(cell).split()))
+                    cur.extend([""] * (getattr(self, "_span", 1) - 1))
+                    cell = None
+                elif t in tags_row and cur is not None:
+                    rows.append(cur)
+                    cur = None
+
+            def handle_data(self, data):
+                if cell is not None:
+                    cell.append(data)
+
+        P().feed(text)
+        self.rows = rows
+
+
+def read_spreadsheet(path):
+    """Returns [(sheet name, rows)] for .csv, .xlsx and .xls files, whatever is really inside."""
+    path = Path(path)
+    data = path.read_bytes()
+    if data[:2] == b"PK":                               # real .xlsx (even if named .xls)
+        if openpyxl is None:
+            raise RuntimeError("openpyxl is not installed")
+        import io
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        sheets = [(ws.title, [["" if c is None else str(c) for c in row] for row in ws.iter_rows(values_only=True)])
+                  for ws in wb.worksheets]
+        wb.close()
+        return sheets
+    if data[:4] == b"\xd0\xcf\x11\xe0":                 # real old-style .xls
+        try:
+            import xlrd
+        except ImportError:
+            raise RuntimeError("This is an old-style .xls file. Double-click \"Install Lab Logger parts.bat\" "
+                               "once so the logger can read it.")
+        book = xlrd.open_workbook(file_contents=data)
+        out = []
+        for sh in book.sheets():
+            rows = []
+            for i in range(sh.nrows):
+                row = []
+                for c in sh.row(i):
+                    v = c.value
+                    if c.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            v = xlrd.xldate.xldate_as_datetime(v, book.datemode).isoformat(sep=" ", timespec="minutes")
+                        except Exception:
+                            pass
+                    elif isinstance(v, float) and v.is_integer():
+                        v = int(v)
+                    row.append("" if v is None else str(v))
+                rows.append(row)
+            out.append((sh.name, rows))
+        return out
+    text = _decode(data)
+    head = text.lstrip()[:500].lower()
+    if head.startswith("<") and ("<table" in text.lower() or "<row" in text.lower() or "<ss:row" in text.lower()):
+        return [("sheet", _TableParser(text).rows)]     # HTML or Excel-XML saved as .xls
+    try:                                                # plain text: tab, comma or semicolon separated
+        dialect = csv.Sniffer().sniff(text[:4000], delimiters="\t,;")
+        delim = dialect.delimiter
+    except csv.Error:
+        delim = "\t" if "\t" in text[:4000] else ","
+    import io
+    return [("sheet", [r for r in csv.reader(io.StringIO(text), delimiter=delim)])]
+
+
+# --------------------------------------------------------------------------
 # Colorimeter folder watcher
 # --------------------------------------------------------------------------
 class FolderWatcher(threading.Thread):
-    EXTENSIONS = {".csv", ".xlsx", ".xlsm"}
+    EXTENSIONS = {".csv", ".xlsx", ".xlsm", ".xls", ".txt"}
 
     def __init__(self, cfg, out_dir):
         super().__init__(daemon=True)
@@ -747,12 +924,14 @@ class FolderWatcher(threading.Thread):
         self.folder = expand(cfg["watch_folder"])
         self.done_dir = self.folder / "imported"
         self.poll = float(cfg.get("poll_seconds", 10))
+        self.diag = {"files": 0, "rows": 0, "last_import": "", "last_error": ""}
+        INSTRUMENTS[cfg["name"]] = self
         self.skip_dupes = bool(cfg.get("skip_duplicates", False))
         self.seen_path = out_dir / self.name_ / ".imported_row_ids.txt"
         self.seen = set()
         if self.skip_dupes and self.seen_path.exists():
             self.seen = set(self.seen_path.read_text(encoding="utf-8").split())
-        set_status(self.name_, f"Watching {self.folder.name}", True, type=cfg.get("type"),
+        set_status(self.name_, f"Watching {self.folder}", True, type=cfg.get("type"), folder=str(self.folder),
                    label=cfg.get("label") or DEVICE_LABELS.get(cfg.get("type"), self.name_))
 
     @staticmethod
@@ -775,24 +954,13 @@ class FolderWatcher(threading.Thread):
                     except PermissionError:
                         continue  # still open in the Linshang software / Excel
                     except Exception as e:
+                        self.diag["last_error"] = f"{f.name}: {e}"
                         log(f"{self.name_}: could not read {f.name}: {e}")
                         self.move(f, self.folder / "failed")
             STOP.wait(self.poll)
 
     def read_rows(self, f):
-        if f.suffix.lower() == ".csv":
-            with open(f, newline="", encoding="utf-8-sig", errors="replace") as fh:
-                table = [r for r in csv.reader(fh)]
-            return [("csv", table)]
-        if openpyxl is None:
-            raise RuntimeError("openpyxl not installed (pip install openpyxl)")
-        wb = openpyxl.load_workbook(f, read_only=True, data_only=True)
-        sheets = []
-        for ws in wb.worksheets:
-            sheets.append((ws.title, [["" if c is None else str(c) for c in row]
-                                      for row in ws.iter_rows(values_only=True)]))
-        wb.close()
-        return sheets
+        return read_spreadsheet(f)
 
     def import_file(self, f):
         ctx = context_snapshot()
@@ -847,6 +1015,8 @@ class FolderWatcher(threading.Thread):
             with open(self.seen_path, "a", encoding="utf-8") as fh:
                 fh.write("\n".join(new_ids) + "\n")
         dest = self.move(f, self.done_dir)
+        self.diag.update(files=self.diag["files"] + 1, rows=self.diag["rows"] + len(rows_out),
+                         last_import=now_iso(), last_error="")
         extra = f", skipped {dupes} already-imported row(s)" if dupes else ""
         log(f"{self.name_}: imported {len(rows_out)} row(s) from {f.name}{extra} -> {dest.parent.name}/")
 
@@ -886,10 +1056,50 @@ class SkalaAuthError(Exception):
     pass
 
 
+class SkalaOffline(Exception):
+    pass
+
+
+class SkalaServerError(Exception):
+    pass
+
+
+def describe_network_error(reason):
+    import ssl
+    import socket
+    text = str(reason)
+    if isinstance(reason, ssl.SSLError) or "CERTIFICATE" in text.upper():
+        return ("A security certificate problem stopped the connection. A company network filter may be "
+                f"inspecting web traffic; ask IT to allow lambda-prod.skalacontrol.com. ({text})")
+    if isinstance(reason, socket.gaierror) or "getaddrinfo" in text or "Name or service" in text:
+        return "No internet: this laptop can't look up SKALA's server address."
+    if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in text:
+        return "No answer from SKALA's server in time (no internet, or a slow or blocked connection)."
+    if "refused" in text.lower() or "unreachable" in text.lower():
+        return f"The connection to SKALA was blocked or refused ({text})."
+    return f"Couldn't reach SKALA ({text})."
+
+
+def read_token_file(path):
+    """Read the SKALA token however Notepad saved it (with or without a hidden BOM, UTF-8 or
+    'Unicode'), and drop quotes, spaces and anything that can't be part of a token."""
+    try:
+        data = Path(path).read_bytes()
+    except (FileNotFoundError, OSError):
+        return ""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = data.decode("utf-16", errors="ignore")
+    else:
+        text = data.decode("utf-8-sig", errors="ignore")
+    text = text.strip().strip('"').strip("'").strip()
+    return "".join(ch for ch in text if 33 <= ord(ch) < 127)
+
+
 class SkalaClient:
     """Makes the same read-only requests the SKALA Control web page makes."""
 
     def __init__(self, api_base, token, sbs_serial, timeout=30):
+        self.last_reply = ""
         self.api_base = api_base.rstrip("/")
         self.token = token
         self.sbs_serial = sbs_serial
@@ -902,17 +1112,30 @@ class SkalaClient:
         req = urllib.request.Request(
             f"{self.api_base}/{endpoint}",
             data=json.dumps(body).encode("utf-8"),
-            headers={"token": self.token, "Accept": "application/json",
-                     "Content-Type": "application/json"},
+            headers={"token": self.token, "Accept": "application/json, text/plain, */*",
+                     "Content-Type": "application/json",
+                     "Origin": "https://skalacontrol.io", "Referer": "https://skalacontrol.io/",
+                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LabLogger/1.0"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 raw = r.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
+            reply = ""
+            try:
+                reply = e.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
+            self.last_reply = f"HTTP {e.code} {reply}"
             if e.code in (401, 403):
-                raise SkalaAuthError(f"SKALA refused the token (HTTP {e.code})")
-            raise
+                raise SkalaAuthError(f"SKALA refused the sign-in (HTTP {e.code}) {reply}".strip())
+            raise SkalaServerError(f"SKALA's server answered with an error (HTTP {e.code}) {reply}".strip())
+        except urllib.error.URLError as e:
+            raise SkalaOffline(describe_network_error(e.reason))
+        except (TimeoutError, OSError) as e:
+            raise SkalaOffline(describe_network_error(e))
+        self.last_reply = raw[:300]
         try:
             outer = json.loads(raw)
         except json.JSONDecodeError:
@@ -945,6 +1168,93 @@ class SkalaClient:
             page += 1
 
 
+class TokenHistory:
+    """Remembers each SKALA token's life: when it was saved, when it last worked, and when SKALA
+    first refused it. Only a short fingerprint of each token is kept, never the token itself."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        try:
+            self.items = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            self.items = []
+
+    def _save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.items, indent=1), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception:
+            pass
+
+    @staticmethod
+    def fingerprint(token):
+        import hashlib
+        return hashlib.sha256(token.encode()).hexdigest()[:10]
+
+    def current(self, token, saved_at=None):
+        fp = self.fingerprint(token)
+        if self.items and self.items[-1]["fp"] == fp:
+            return self.items[-1]
+        item = {"fp": fp, "saved_at": saved_at or now_iso(), "first_ok": "", "last_ok": "", "refused_at": ""}
+        self.items.append(item)
+        self.items = self.items[-50:]
+        self._save()
+        return item
+
+    def worked(self, token):
+        it = self.current(token)
+        it["last_ok"] = now_iso()
+        it["first_ok"] = it["first_ok"] or it["last_ok"]
+        it["refused_at"] = ""          # working again (e.g. a brief server hiccup earlier)
+        self._save()
+
+    def refused(self, token):
+        it = self.current(token)
+        if not it["refused_at"]:
+            it["refused_at"] = now_iso()
+            self._save()
+            if it["first_ok"]:
+                log(f"SKALA token stopped working. It was saved {it['saved_at'][:16].replace('T', ' ')} "
+                    f"and last worked {it['last_ok'][:16].replace('T', ' ')} ({fmt_days(lifetime_days(it))}).")
+
+    def summary(self):
+        done = [i for i in self.items if i["first_ok"] and i["refused_at"]]
+        lives = [lifetime_days(i) for i in done]
+        cur = self.items[-1] if self.items else None
+        out = {"current": cur, "past": done[-10:], "typical_days": None, "expected_end": ""}
+        if lives:
+            lives_sorted = sorted(lives)
+            typical = lives_sorted[len(lives_sorted) // 2]
+            out["typical_days"] = round(typical, 1)
+            if cur and not cur["refused_at"]:
+                start = dt.datetime.fromisoformat(cur["saved_at"])
+                out["expected_end"] = (start + dt.timedelta(days=typical)).isoformat(timespec="minutes")
+        return out
+
+
+def lifetime_days(item):
+    """How long a token kept working: from when it was saved to the last time it worked
+    (it ran out somewhere between then and when SKALA first refused it)."""
+    try:
+        a = dt.datetime.fromisoformat(item["saved_at"])
+        b = dt.datetime.fromisoformat(item["last_ok"] or item["refused_at"])
+        return max(0.0, (b - a).total_seconds() / 86400)
+    except Exception:
+        return 0.0
+
+
+def fmt_days(d):
+    if d is None:
+        return ""
+    if d < 1:
+        h = max(1, round(d * 24))
+        return f"about {h} hour{'s' if h != 1 else ''}"
+    return f"about {d:.1f} days"
+
+
+
 class SkalaFetcher(threading.Thread):
     """Polls SKALA Control and saves new AQUALAB 3 readings. Only reads data."""
 
@@ -972,14 +1282,21 @@ class SkalaFetcher(threading.Thread):
             except Exception:
                 pass
         self.auth_warned = False
+        self.diag = {"last_ok": "", "last_error": "", "last_reply": "", "batches": 0}
+        self.tokens = TokenHistory(out_dir / self.name_ / ".skala_token_history.json")
+        tok = self.read_token()
+        if tok:   # first time we see this token: date it from when the file was saved
+            try:
+                mtime = dt.datetime.fromtimestamp(self.token_file.stat().st_mtime).isoformat(timespec="seconds")
+            except OSError:
+                mtime = None
+            self.tokens.current(tok, saved_at=mtime)
+        INSTRUMENTS[cfg["name"]] = self
         set_status(self.name_, "SKALA · starting", False, type="skala_api",
                    label=cfg.get("label") or DEVICE_LABELS["skala_api"])
 
     def read_token(self):
-        try:
-            return self.token_file.read_text(encoding="utf-8").strip().strip('"').strip("'")
-        except FileNotFoundError:
-            return ""
+        return read_token_file(self.token_file)
 
     def run(self):
         log(f"{self.name_}: SKALA fetcher on, checking every {self.poll / 60:g} min "
@@ -988,21 +1305,29 @@ class SkalaFetcher(threading.Thread):
             try:
                 n = self.poll_once()
                 set_status(self.name_, f"SKALA · last check {dt.datetime.now():%H:%M}", True)
+                self.diag.update(last_ok=now_iso(), last_error="")
+                tok = self.read_token()
+                if tok:
+                    self.tokens.worked(tok)
                 if n:
                     log(f"{self.name_}: saved {n} new reading(s) from SKALA")
                 self.auth_warned = False
             except SkalaAuthError as e:
-                set_status(self.name_, "SKALA · token expired or invalid", False)
+                self.diag["last_error"] = str(e)
+                tok = self.read_token()
+                if tok:
+                    self.tokens.refused(tok)
+                set_status(self.name_, "SKALA · sign-in refused (token expired or invalid)", False)
                 if not self.auth_warned:
-                    log(f"{self.name_}: {e}. Paste a fresh token into {self.token_file} "
-                        f"(see guide); will keep retrying.")
+                    log(f"{self.name_}: {e}. Paste a fresh token on the Support page; will keep retrying.")
                     self.auth_warned = True
-            except Exception as e:  # offline, timeout, server hiccup
+            except SkalaOffline as e:
+                self.diag["last_error"] = str(e)
                 set_status(self.name_, "SKALA · unreachable (no internet?)", False)
-                if "urlopen" in str(e) or "timed out" in str(e) or isinstance(e, OSError):
-                    pass  # quietly wait while offline
-                else:
-                    log(f"{self.name_}: SKALA check failed: {e}")
+            except Exception as e:  # server error or something unexpected: say exactly what
+                self.diag["last_error"] = f"{type(e).__name__}: {e}"
+                set_status(self.name_, "SKALA · error (see Support page)", False)
+                log(f"{self.name_}: SKALA check failed: {type(e).__name__}: {e}")
             SKALA_SYNC_NOW.wait(self.poll)
             SKALA_SYNC_NOW.clear()
 
@@ -1013,6 +1338,7 @@ class SkalaFetcher(threading.Thread):
         if not self.sbs_serial:
             raise RuntimeError("sbs_serial is empty in the config")
         client = SkalaClient(self.api_base, token, self.sbs_serial)
+        self.client = client
         cutoff = dt.datetime.now() - dt.timedelta(days=self.lookback)
         full = time.time() - self.state.get("last_full_scan", 0) > self.full_rescan
         new_rows, new_ids = [], []
@@ -1465,6 +1791,190 @@ def assign_lot(record_ids, lot, operator):
 
 
 # --------------------------------------------------------------------------
+# Support page: live port diagnostics and changing ports without editing files
+# --------------------------------------------------------------------------
+BAUD_RATES = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
+QUERY_COMMANDS = {"mb90": "V", "ph": "PV"}   # harmless "what version are you?" questions
+
+
+def _printable(data):
+    if not data:
+        return 0.0
+    return sum(1 for b in data if 32 <= b < 127 or b in (9, 10, 13, 0xB0)) / len(data)
+
+
+def list_ports_info():
+    out = []
+    if serial is None:
+        return out
+    for p in sorted(serial.tools.list_ports.comports(), key=lambda x: x.device):
+        used = [n for n, i in INSTRUMENTS.items()
+                if isinstance(i, SerialInstrument) and str(i.cfg.get("port", "")).upper() == p.device.upper()]
+        out.append({"device": p.device, "description": p.description or "", "used_by": used[0] if used else "",
+                    "bluetooth": "bluetooth" in (p.description or "").lower()})
+    return out
+
+
+def support_state():
+    insts = []
+    for name, i in INSTRUMENTS.items():
+        d = DEVICES.get(name, {})
+        item = {"name": name, "label": d.get("label", name), "type": d.get("type", ""), "ok": d.get("ok", False),
+                "detail": d.get("detail", "")}
+        if isinstance(i, SerialInstrument):
+            item.update(port=i.cfg.get("port", ""), baudrate=int(i.cfg.get("baudrate", 9600)),
+                        diag=dict(i.diag), lines=list((LIVE.get(name) or {}).get("lines") or [])[-40:])
+        elif isinstance(i, FolderWatcher):
+            folder = i.folder
+            waiting = [f.name for f in folder.iterdir() if f.is_file()] if folder.exists() else []
+            failed = [f.name for f in (folder / "failed").iterdir()] if (folder / "failed").exists() else []
+            item.update(folder=str(folder), folder_exists=folder.exists(), waiting=waiting[:20],
+                        failed=failed[-10:], diag=dict(i.diag))
+        elif isinstance(i, SkalaFetcher):
+            tok = i.read_token()
+            item.update(token_file=str(i.token_file), token_found=bool(tok), token_length=len(tok),
+                        token_end=tok[-4:] if tok else "", sbs_serial=i.sbs_serial, diag=dict(i.diag),
+                        tokens=i.tokens.summary())
+        insts.append(item)
+    return {"instruments": insts, "ports": list_ports_info(), "bauds": BAUD_RATES,
+            "config_path": str(CONFIG_PATH), "log": list(LOG_TAIL)[-80:], "version": VERSION,
+            "program_path": str(Path(__file__).resolve()),
+            "pin_required": bool(DASH.get("support_pin"))}
+
+
+def save_port_settings(name, changes):
+    inst = INSTRUMENTS.get(name)
+    if not isinstance(inst, SerialInstrument):
+        raise ValueError("That instrument doesn't use a port.")
+    port = str(changes.get("port", "")).strip()
+    if not re.fullmatch(r"(COM\d+|/dev/[\w./-]+)", port, re.I):
+        raise ValueError("Choose a port such as COM3.")
+    for other_name, other in INSTRUMENTS.items():
+        if other_name != name and isinstance(other, SerialInstrument) and str(other.cfg.get("port", "")).upper() == port.upper():
+            label = (DEVICES.get(other_name) or {}).get("label", other_name)
+            raise ValueError(f"{port} is already set for the {label}. Two instruments can't share a port.")
+    baud = int(changes.get("baudrate", inst.cfg.get("baudrate", 9600)))
+    if baud not in BAUD_RATES:
+        raise ValueError("Choose a speed from the list.")
+    new = {"port": port.upper() if port.upper().startswith("COM") else port, "baudrate": baud}
+    # write the settings file (only this instrument's port and speed change)
+    cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else json.loads(json.dumps(DEFAULT_CONFIG))
+    for entry in cfg.setdefault("instruments", []):
+        if entry.get("name") == name:
+            entry.update(new)
+            break
+    else:
+        cfg["instruments"].append({**inst.cfg, **new})
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    os.replace(tmp, CONFIG_PATH)
+    inst.reconfigure(new)
+    log(f"Support page: {name} set to {new['port']} at {baud} baud (saved to settings)")
+    return new
+
+
+def listen_on_port(port, baud=9600, seconds=10):
+    if serial is None:
+        raise RuntimeError("pyserial is not installed")
+    for name, i in INSTRUMENTS.items():
+        if isinstance(i, SerialInstrument) and str(i.cfg.get("port", "")).upper() == port.upper() and i.diag.get("open"):
+            label = (DEVICES.get(name) or {}).get("label", name)
+            raise RuntimeError(f"The {label} is using {port} right now, so its data already shows in its box above.")
+    seconds = max(2, min(int(seconds), 15))
+    try:
+        sp = serial.Serial(port, int(baud), timeout=0.3)
+    except Exception as e:
+        raise RuntimeError(f"Couldn't open {port}: {e}")
+    data = bytearray()
+    end = time.time() + seconds
+    try:
+        while time.time() < end:
+            chunk = sp.read(512)
+            if chunk:
+                data += chunk
+    finally:
+        sp.close()
+    ratio = _printable(bytes(data))
+    if not data:
+        verdict = "Nothing received. If you pressed Print, this isn't the instrument's port (or its output setting is wrong)."
+    elif ratio > 0.9:
+        verdict = "Readable data received. This port is sending information."
+    else:
+        verdict = "Data received but it's garbled: the speed (baud rate) probably doesn't match."
+    return {"bytes": len(data), "text": data.decode("latin-1", errors="replace")[:2000], "verdict": verdict,
+            "good": bool(data) and ratio > 0.9}
+
+
+def skala_test_steps(fetcher):
+    """Plain-words, step-by-step check of the SKALA link (read-only)."""
+    steps = []
+    tok = fetcher.read_token()
+    if not tok:
+        return [("bad", "Sign-in token", f"No token saved yet ({fetcher.token_file}). Paste it above and press Save.")]
+    steps.append(("ok", "Sign-in token", f"Saved ({len(tok)} characters, ends …{tok[-4:]})."))
+    if not fetcher.sbs_serial:
+        steps.append(("bad", "Browser ID (sbs_serial)", "Empty. Fill it in above."))
+        return steps
+    client = SkalaClient(fetcher.api_base, tok, fetcher.sbs_serial, timeout=20)
+    try:
+        data = client.call("get_batches_ionic", page_num=1, page_size=5, filter_text="") or {}
+    except SkalaOffline as e:
+        steps.append(("bad", "Internet", str(e)))
+        return steps
+    except SkalaAuthError as e:
+        steps.append(("ok", "Internet", "Reached SKALA's server."))
+        steps.append(("bad", "Sign-in", f"{e}. The token is wrong or expired: copy a fresh one from Chrome."))
+        fetcher.tokens.refused(tok)
+        return steps
+    except Exception as e:
+        steps.append(("ok", "Internet", "Reached SKALA's server."))
+        steps.append(("bad", "SKALA's reply", f"{type(e).__name__}: {e}"))
+        steps.append(("info", "What the server said", client.last_reply or "(nothing)"))
+        return steps
+    steps.append(("ok", "Internet", "Reached SKALA's server."))
+    batches = (data.get("batches") or []) if isinstance(data, dict) else []
+    if not isinstance(data, dict):
+        steps.append(("bad", "Sign-in", "SKALA answered, but not with readings. The token or browser ID may be wrong."))
+        steps.append(("info", "What the server said", client.last_reply or "(nothing)"))
+        return steps
+    steps.append(("ok", "Sign-in", "Accepted."))
+    fetcher.tokens.worked(tok)
+    if batches:
+        steps.append(("ok", "Readings", f"Found batches; newest: {batches[0].get('name')} ({batches[0].get('product')}, {batches[0].get('date')})."))
+    else:
+        steps.append(("warn", "Readings", "Signed in, but SKALA returned no batches. If you do have batches, the browser ID (sbs_serial) may be wrong."))
+        steps.append(("info", "What the server said", client.last_reply or "(nothing)"))
+    return steps
+
+
+def save_skala_settings(fetcher, token=None, sbs_serial=None):
+    if token:
+        clean = "".join(ch for ch in token.strip().strip('"').strip("'") if 33 <= ord(ch) < 127)
+        if len(clean) < 10:
+            raise ValueError("That doesn't look like a full token. Copy the whole credential_token value.")
+        fetcher.token_file.parent.mkdir(parents=True, exist_ok=True)
+        fetcher.token_file.write_text(clean, encoding="ascii")
+        fetcher.tokens.current(clean)
+        log(f"Support page: new SKALA token saved ({len(clean)} characters)")
+    if sbs_serial is not None and sbs_serial.strip() and sbs_serial.strip() != fetcher.sbs_serial:
+        new = sbs_serial.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{2,40}", new):
+            raise ValueError("The browser ID should be letters and numbers only, like SKM16F64.")
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else json.loads(json.dumps(DEFAULT_CONFIG))
+        for entry in cfg.setdefault("instruments", []):
+            if entry.get("name") == fetcher.name_:
+                entry["sbs_serial"] = new
+        tmp = CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        os.replace(tmp, CONFIG_PATH)
+        fetcher.sbs_serial = new
+        fetcher.cfg["sbs_serial"] = new
+        log(f"Support page: SKALA browser ID set to {new}")
+    fetcher.auth_warned = False
+    SKALA_SYNC_NOW.set()
+
+
+# --------------------------------------------------------------------------
 # Dashboard: a local web page at http://localhost:8080 (this laptop only)
 # --------------------------------------------------------------------------
 UPLOAD_CFG = {"folder": ""}
@@ -1776,16 +2286,21 @@ function plain(d){
   const sup = esc(S.support || 'your supervisor');
   const det = (d.detail || '').toLowerCase();
   if(d.type === 'mb90' || d.type === 'ph'){
-    return d.ok ? {short:'Plugged in and ready', help: d.type === 'mb90' ? 'Run tests as normal. Results save by themselves when each test finishes.' : 'Take a reading, then tap the printer icon on the meter to save it.'}
+    const fix = d.type === 'mb90'
+      ? ' If you press Print and nothing arrives, check on the MB90: Setup → Device settings → Peripheral settings → Device Port must be COM4 (its USB socket).'
+      : ' If you tap print and nothing arrives, check on the meter: Settings → RS232 → Export to must be PC.';
+    if(d.ok && !d.last_data) return {short:'Plugged in · nothing received yet',
+      help:(d.type === 'mb90' ? 'Run tests as normal. Results save by themselves when each test finishes.' : 'Take a reading, then tap the printer icon on the meter to save it.') + fix};
+    return d.ok ? {short:'Plugged in · data received ' + ago(d.last_data), help: d.type === 'mb90' ? 'Run tests as normal. Results save by themselves when each test finishes. Pressing Print saves the printout too.' : 'Take a reading, then tap the printer icon on the meter to save it.'}
                 : {short:'Check the USB cable', help:'Make sure the instrument is switched on and its USB cable is plugged into this laptop. It reconnects by itself within a few seconds. Still red? Tell ' + sup + '.'};
   }
   if(d.type === 'colorimeter_folder'){
-    return d.ok ? {short:'Ready for exports', help:'After scanning, click Export Excel in the Linshang software and save into the Colorimeter Exports folder.'}
+    return d.ok ? {short:'Ready for exports', help:'After scanning, click Export Excel in the Linshang software and save the file into this folder:<br><b style="font-family:var(--mono);font-weight:500;word-break:break-all">' + esc(d.folder || 'Colorimeter Exports') + '</b>'}
                 : {short:'Export folder missing', help:'Tell ' + sup + '.'};
   }
   if(d.type === 'skala_api' || d.type === 'export_folder'){
     if(d.ok) return {short:'Linked to SKALA', help:'Run tests as normal in SKALA. Readings appear here a few minutes after each test.'};
-    if(det.includes('token') || det.includes('sign')) return {short:'SKALA sign-in expired', help:'Readings are safe in SKALA, but they can\'t come through until the sign-in is renewed. Tell ' + sup + '.'};
+    if(det.includes('token') || det.includes('sign')) return {short:'SKALA needs reconnecting', help:'Readings are safe in SKALA. To reconnect: press <b>Open SKALA</b> below, sign in if it asks, then click the <b>Send to Lab Logger</b> button at the top of Chrome. If that button isn\'t there, tell ' + sup + '.'};
     return {short:'Waiting for internet', help:'Nothing to do. Readings are safe in SKALA and come through by themselves when this laptop is back online.'};
   }
   return {short: d.detail || '', help: ''};
@@ -1820,6 +2335,7 @@ function homeShell(){
         <div class="row" style="flex-wrap:wrap;justify-content:flex-end"><span id="excelInfo" class="muted" style="font-size:13px"></span>
         <button class="btn" type="button" id="openExcel">Open in Excel</button></div></div>
       <div class="scroll"><table><thead><tr><th>Time</th><th>Lot</th><th>Instrument</th><th>Measurement</th><th class="r">Value</th><th>Operator</th></tr></thead><tbody id="recentBody"></tbody></table></div></section>
+    <p style="margin:0;text-align:center;font-size:13px"><a href="#support" class="muted">Support page (setup and fault-finding)</a></p>
   </main>`;
 }
 const FIELDS = {lot: 'lot', op: 'operator', note: 'note'};
@@ -1954,7 +2470,8 @@ function viewDevice(name){
   const results = D.results.map(r => `<div><div style="display:flex;flex-direction:column;gap:2px"><span style="font-size:14px;font-weight:500">${esc(r.measurement)}</span>
       <span class="muted" style="font-size:13px">${esc(hhmm(r.time))} · ${esc(r.lot||'no lot')}</span></div><span style="font-family:var(--mono);font-weight:500">${esc(r.value)} ${esc(r.unit)}</span></div>`).join('')
       || '<div><span class="muted">No results yet</span></div>';
-  const skala = d.type === 'skala_api' ? '<button class="btn" id="sync" type="button">Check SKALA now</button>' : '';
+  const skala = d.type === 'skala_api' ? '<a class="btn primary" href="https://skalacontrol.io" target="_blank" rel="noopener">Open SKALA</a><button class="btn" id="sync" type="button">Check SKALA now</button>'
+              : (d.type === 'colorimeter_folder' || d.type === 'export_folder') ? '<button class="btn" id="openFolder" type="button">Open the export folder</button><span id="folderMsg" class="muted" style="font-size:13px"></span>' : '';
   return header(`<div class="row" style="flex-wrap:wrap;justify-content:flex-start;gap:16px"><a class="back" href="#">${icon.back} All instruments</a>
       <b style="font-size:20px">${esc(d.label)}</b>${statusHtml(d)}<span class="muted" style="font-size:14px">${esc(plain(d).short)}</span></div>
       <span class="muted" style="font-size:14px">Lot <b style="font-family:var(--mono);color:var(--ink);font-weight:500">${esc(S.context.lot||'—')}</b> · ${esc(S.context.operator||'no operator')}</span>`)
@@ -1966,7 +2483,7 @@ function viewDevice(name){
 }
 function hint(d){
   return {mb90:'Run a test; results appear when it finishes.', ph:'Take a reading and tap the printer icon on the meter.',
-    colorimeter_folder:'Export Excel from the Linshang software into the Colorimeter Exports folder.',
+    colorimeter_folder:'After scanning, use Export Excel in the Linshang software and save into the export folder (see the right).',
     skala_api:'Readings come through from SKALA a few minutes after each test, whenever the laptop is online.', export_folder:'Save SKALA downloads into the watch folder.'}[d.type] || '';
 }
 
@@ -2015,6 +2532,13 @@ function render(){
     updateHome();
     return;
   }
+  if(h === 'connect-skala'){ if(!$('#app').innerHTML.includes('Connect SKALA')) renderConnect(); return; }
+  if(h === 'support'){
+    if(!SP) return;
+    if(!$('#sLog')){ app.innerHTML = supportShell(); bindSupport(); }
+    updateSupport();
+    return;
+  }
   const openIds = [...document.querySelectorAll('details[open]')].map(x => x.id).filter(Boolean);
   if(h.startsWith('device/')) app.innerHTML = viewDevice(decodeURIComponent(h.slice(7)));
   else if(h === 'upload') { if(!$('#up')) app.innerHTML = viewUpload(); }
@@ -2041,6 +2565,9 @@ function bind(){
       xi.textContent = j.ok ? 'Opened in Excel. This is a copy, so the logger keeps saving while it\'s open.' : j.error; xi.style.color = j.ok ? 'var(--okInk)' : 'var(--badInk)'; }
     catch(e){ xi.textContent = 'Excel didn\'t open. Try again.'; }
     excelMsgAt = Date.now(); ox.disabled = false; };
+  const of = $('#openFolder');
+  if(of) of.onclick = async () => { const j = await (await post('/api/open_folder', {name: D.device.name})).json();
+    $('#folderMsg').textContent = j.ok ? 'Opened in File Explorer.' : j.error; };
   const sync = $('#sync'); if(sync) sync.onclick = async () => { sync.disabled = true; sync.textContent = 'Checking…'; await post('/api/sync'); };
   const up = $('#up');
   if(up) up.onsubmit = async e => {
@@ -2068,11 +2595,238 @@ function bind(){
     await refresh(); $('#app').innerHTML = viewUpload(); bind();
   };
 }
+// ---------------- Support page (setup and fault-finding) ----------------
+let SP = null;
+function pinFor(){ if(!SP || !SP.pin_required) return ''; let p = sessionStorage.getItem('supportPin');
+  if(!p){ p = prompt('Support PIN') || ''; sessionStorage.setItem('supportPin', p); } return p; }
+async function supPost(path, body){
+  const res = await post(path, {...body, pin: pinFor()}); const j = await res.json();
+  if(j.pin) sessionStorage.removeItem('supportPin');
+  return j;
+}
+function portOptions(current){
+  const opts = SP.ports.map(p => `<option value="${esc(p.device)}" ${p.device.toUpperCase() === String(current).toUpperCase() ? 'selected' : ''}>${esc(p.device)} · ${esc(p.description)}${p.used_by ? ' (set for ' + esc(labelOfInst(p.used_by)) + ')' : ''}</option>`);
+  if(!SP.ports.some(p => p.device.toUpperCase() === String(current).toUpperCase()))
+    opts.unshift(`<option value="${esc(current)}" selected>${esc(current)} · not found on this laptop</option>`);
+  return opts.join('');
+}
+const labelOfInst = n => ((SP && SP.instruments.find(i => i.name === n)) || {}).label || n;
+function badge(i){
+  const d = i.diag || {};
+  if(i.type === 'mb90' || i.type === 'ph'){
+    if(!d.open) return ['bad', 'Not connected', d.last_error ? 'Windows says: ' + d.last_error : 'The port isn\'t open.'];
+    if(!d.last_data) return ['warn', 'Port open · no data yet', 'Press Print on the instrument. If nothing arrives here, check its output setting, or try another port.'];
+    const age = (Date.now() - new Date(d.last_data).getTime()) / 1000;
+    return ['ok', age < 120 ? 'Receiving data' : 'Port open · data received earlier', 'Last data ' + ago(d.last_data) + '.'];
+  }
+  if(i.type === 'skala_api') return [i.ok ? 'ok' : 'bad', i.ok ? 'Linked to SKALA' : 'Not linked', i.detail];
+  return [i.folder_exists ? 'ok' : 'bad', i.folder_exists ? 'Watching folder' : 'Folder missing', i.folder || ''];
+}
+const when = t => t ? new Date(t).toLocaleString([], {weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'}) : '';
+const days = d => { if(d == null) return ''; if(d < 1){ const h = Math.max(1, Math.round(d * 24)); return 'about ' + h + (h == 1 ? ' hour' : ' hours'); } return 'about ' + d.toFixed(1) + ' days'; };
+function lifeOf(i){ const a = new Date(i.saved_at), b = new Date(i.last_ok || i.refused_at || Date.now()); return Math.max(0, (b - a) / 86400000); }
+function tokenLife(t){
+  if(!t || !t.current) return '';
+  const c = t.current;
+  let html = '<b>How long tokens last</b><br>';
+  html += c.refused_at
+    ? `This token was saved ${esc(when(c.saved_at))}, last worked ${esc(when(c.last_ok) || 'never')}, and was refused from ${esc(when(c.refused_at))}. <b style="color:var(--badInk)">It needs replacing.</b>`
+    : c.last_ok
+      ? `This token was saved ${esc(when(c.saved_at))} and is still working (${days(lifeOf(c))} so far, last checked ${esc(when(c.last_ok))}).`
+      : `This token was saved ${esc(when(c.saved_at))} and hasn't been used with SKALA yet.`;
+  if(t.typical_days != null){
+    html += `<br>Past tokens lasted <b>${days(t.typical_days)}</b> (typical of ${t.past.length}).`;
+    if(t.expected_end) html += ` Expect this one to need replacing around <b>${esc(when(t.expected_end))}</b>.`;
+    html += '<div class="muted" style="font-size:13px;margin-top:4px">' + t.past.slice().reverse().map(p =>
+      `${esc(when(p.saved_at))} → last worked ${esc(when(p.last_ok))} (${days(lifeOf({saved_at:p.saved_at, last_ok:p.last_ok}))})`).join('<br>') + '</div>';
+  } else {
+    html += '<span class="muted">No token has run out yet, so there\'s nothing to measure. Once one does, this shows how long it lasted.</span>';
+  }
+  html += '<div class="muted" style="font-size:13px;margin-top:4px">Measured while this laptop is online: the logger checks SKALA every few minutes. Signing out of SKALA in Chrome may end a token early.</div>';
+  return html;
+}
+function supportShell(){
+  const serialBoxes = SP.instruments.filter(i => i.type === 'mb90' || i.type === 'ph').map(i => `
+    <section class="card pad" id="sup-${esc(i.name)}" style="gap:14px">
+      <div class="row" style="flex-wrap:wrap"><h2>${esc(i.label)}</h2><span class="sbadge" style="font-size:14px;font-weight:500"></span></div>
+      <p class="smsg muted" style="margin:0;font-size:14px"></p>
+      <div class="kv sfacts" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));flex:none"></div>
+      <form class="sform" style="display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px">
+        <div class="field"><label>Port</label><select name="port" style="min-width:320px">${portOptions(i.port)}</select></div>
+        <div class="field"><label>Speed (baud)</label><select name="baudrate">${SP.bauds.map(b => `<option ${b == i.baudrate ? 'selected' : ''}>${b}</option>`).join('')}</select></div>
+        <button class="btn dark" type="submit">Save and reconnect</button>
+        <button class="btn sask" type="button">Ask it a question</button>
+      </form>
+      <div class="sresult" style="font-size:14px"></div>
+      <details><summary style="cursor:pointer;min-height:40px;display:flex;align-items:center;font-size:14px;color:var(--muted)">What it sent (live)</summary><pre class="sfeed"></pre></details>
+    </section>`).join('');
+  const portRows = SP.ports.map(p => `<tr><td class="m">${esc(p.device)}</td><td>${esc(p.description)}${p.bluetooth ? ' <span class="muted">(Bluetooth, not an instrument)</span>' : ''}</td>
+      <td>${p.used_by ? esc(labelOfInst(p.used_by)) : '<span class="muted">not used</span>'}</td>
+      <td>${p.used_by ? '' : `<button class="btn slisten" type="button" data-port="${esc(p.device)}">Listen 10 s</button>`}</td></tr>`).join('')
+      || '<tr><td colspan="4" class="muted" style="padding:16px">No ports found. Check the instruments are plugged in and switched on.</td></tr>';
+  return header(`<div class="row" style="flex-wrap:wrap;justify-content:flex-start;gap:16px"><a class="back" href="#">${icon.back} All instruments</a><b style="font-size:20px">Support page</b></div>
+      <span class="muted" style="font-size:14px">For setup and fault-finding. Operators don't need this page.</span>`)
+  + `<main>
+    ${serialBoxes}
+    <section class="card" aria-label="Ports"><div class="hd"><h2>All ports on this laptop</h2>
+      <button class="btn" type="button" id="sRescan">Look for ports again</button></div>
+      <div class="pad" style="padding-top:12px;gap:10px"><p class="muted" style="margin:0;font-size:14px">To find which port an instrument is on: press <b>Listen 10 s</b> next to a port, then press Print on the instrument straight away.</p>
+      <div class="scroll"><table style="min-width:560px"><thead><tr><th>Port</th><th>Description</th><th>Used by</th><th></th></tr></thead><tbody>${portRows}</tbody></table></div>
+      <div id="sListen" style="font-size:14px"></div></div></section>
+    ${SP.instruments.some(i => i.type === 'skala_api') ? `
+    <section class="card pad" id="sSkala" style="gap:14px">
+      <div class="row" style="flex-wrap:wrap"><h2>AQUALAB 3 · SKALA link</h2><span id="sSkBadge" style="font-size:14px;font-weight:500"></span></div>
+      <div id="sSkStatus" class="muted" style="font-size:14px;line-height:1.6"></div>
+      <div id="sSkLife" style="font-size:14px;line-height:1.6"></div>
+      <form id="sSkForm" style="display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px">
+        <div class="field" style="flex:1 1 320px"><label for="sSkTok">New sign-in token (exchange_token)</label>
+          <input type="password" id="sSkTok" autocomplete="off" placeholder="Paste here (leave empty to keep the current one)" style="width:100%"></div>
+        <div class="field"><label for="sSkSer">Browser ID (sbs_serial)</label><input type="text" id="sSkSer" style="width:160px;font-family:var(--mono)"></div>
+        <button class="btn dark" type="submit">Save</button>
+        <button class="btn" type="button" id="sSkTest">Test SKALA connection</button>
+      </form>
+      <div style="padding:14px 16px;border:1px dashed #9BB4D8;border-radius:10px;background:#F4F8FD;display:flex;flex-direction:column;gap:10px">
+        <b style="font-size:15px">Easiest: the "Send to Lab Logger" button (set up once on this laptop)</b>
+        <ol style="margin:0;padding-left:20px;font-size:14px;line-height:1.7">
+          <li>In Chrome, press <b>Ctrl+Shift+B</b> to show the bookmarks bar.</li>
+          <li>Drag this button onto the bookmarks bar: <a id="sSkBm" href="#" style="display:inline-block;padding:6px 14px;border-radius:8px;background:var(--accent);color:#fff;text-decoration:none;font-weight:500">Send to Lab Logger</a></li>
+          <li>To connect: open skalacontrol.io, sign in, then click <b>Send to Lab Logger</b>. A tab opens saying "SKALA is connected".</li>
+        </ol>
+        <span class="muted" style="font-size:13px">Clicking the button here does nothing; it only works when clicked on the SKALA page.</span>
+      </div>
+      <details><summary style="cursor:pointer;min-height:40px;display:flex;align-items:center;font-size:14px;color:var(--muted)">Doing it by hand instead</summary>
+        <div style="font-size:14px;line-height:1.7"><b>Token:</b> sign in at skalacontrol.io → press F12 → <b>Application</b> → Local storage → https://skalacontrol.io → click <b>exchange_token</b> → copy its value (without the quotes).<br>
+        <b>Browser ID:</b> in the same list, the value of <b>applicationID</b> (for example SKM16F64).</div></details>
+      <div id="sSkResult" style="font-size:14px"></div>
+    </section>` : ''}
+    <section class="card pad" id="sOther" style="gap:12px"><h2>Colorimeter</h2><div id="sOtherBody"></div></section>
+    <section class="card pad" style="gap:8px"><h2>Recent log</h2><p class="muted" style="margin:0;font-size:13px">Settings file: ${esc(SP.config_path)}<br>Program: ${esc(SP.program_path)} · version ${esc(SP.version)}</p><pre id="sLog" style="max-height:360px"></pre></section>
+  </main>`;
+}
+function updateSupport(){
+  for(const i of SP.instruments.filter(i => i.type === 'mb90' || i.type === 'ph')){
+    const box = document.getElementById('sup-' + i.name); if(!box) continue;
+    const [cls, text, msg] = badge(i), d = i.diag || {};
+    const color = {ok:'var(--okInk)', warn:'var(--warnInk)', bad:'var(--badInk)'}[cls];
+    const dot = {ok:'var(--ok)', warn:'var(--warn)', bad:'var(--bad)'}[cls];
+    box.querySelector('.sbadge').innerHTML = `<span style="display:inline-flex;align-items:center;gap:8px;color:${color}"><span class="dot" style="background:${dot}"></span>${esc(text)}</span>`;
+    box.querySelector('.smsg').textContent = msg;
+    box.querySelector('.sfacts').innerHTML = [['Port', d.port || i.port], ['Data received', (d.bytes || 0).toLocaleString() + ' bytes'],
+      ['Lines', (d.lines || 0).toLocaleString()], ['Results saved', d.records || 0], ['Last line', d.last_line || '—']]
+      .map(([k, v]) => `<div><span>${esc(k)}</span><span style="font-size:15px;word-break:break-all">${esc(v)}</span></div>`).join('');
+    const feed = box.querySelector('.sfeed'); const txt = (i.lines || []).map(l => l[0] + '  ' + l[1]).join('\n') || 'Nothing received yet.';
+    if(feed.textContent !== txt){ feed.textContent = txt; feed.scrollTop = feed.scrollHeight; }
+  }
+  const sk = SP.instruments.find(i => i.type === 'skala_api');
+  if(sk && $('#sSkStatus')){
+    const dg = sk.diag || {};
+    $('#sSkBadge').innerHTML = `<span style="display:inline-flex;align-items:center;gap:8px;color:${sk.ok ? 'var(--okInk)' : 'var(--badInk)'}"><span class="dot" style="background:${sk.ok ? 'var(--ok)' : 'var(--bad)'}"></span>${sk.ok ? 'Linked' : 'Not linked'}</span>`;
+    $('#sSkStatus').innerHTML = `${esc(sk.detail)}${dg.last_ok ? ' · last success ' + esc(hhmm(dg.last_ok)) : ''}<br>
+      Token: ${sk.token_found ? 'saved (' + sk.token_length + ' characters, ends …' + esc(sk.token_end) + ')' : '<b style="color:var(--badInk)">none saved</b>'} · Browser ID: <span style="font-family:var(--mono)">${esc(sk.sbs_serial || '—')}</span>
+      ${dg.last_error ? '<br><b style="color:var(--badInk)">Last problem: ' + esc(dg.last_error) + '</b>' : ''}`;
+    $('#sSkLife').innerHTML = tokenLife(sk.tokens);
+    const ser = $('#sSkSer'); if(ser && !ser.dataset.touched && document.activeElement !== ser) ser.value = sk.sbs_serial || '';
+  }
+  $('#sOtherBody').innerHTML = SP.instruments.filter(i => !(i.type === 'mb90' || i.type === 'ph' || i.type === 'skala_api')).map(i => {
+    const [cls, text] = badge(i), color = {ok:'var(--okInk)', bad:'var(--badInk)'}[cls] || '';
+    if(i.type === 'skala_api') return `<div style="padding:10px 0;border-top:1px solid var(--line2)"><b>${esc(i.label)}</b> · <span style="color:${color}">${esc(text)}</span>
+       <div class="muted" style="font-size:14px">${esc(i.detail)} · token file ${i.token_found ? 'found (' + i.token_length + ' characters)' : '<b style="color:var(--badInk)">missing or empty</b>'}: ${esc(i.token_file)}</div></div>`;
+    const dg = i.diag || {};
+    return `<div style="padding:10px 0;border-top:1px solid var(--line2)"><b>${esc(i.label)}</b> · <span style="color:${color}">${esc(text)}</span>
+       <div class="muted" style="font-size:14px;line-height:1.6">Folder: ${esc(i.folder)}<br>Files imported: ${dg.files || 0} (${dg.rows || 0} rows)${dg.last_import ? ', last at ' + esc(hhmm(dg.last_import)) : ''}
+       <br>Waiting to be read: ${i.waiting && i.waiting.length ? esc(i.waiting.join(', ')) : 'none'}
+       ${i.failed && i.failed.length ? '<br><b style="color:var(--badInk)">Could not be read: ' + esc(i.failed.join(', ')) + '</b>' : ''}
+       ${dg.last_error ? '<br><b style="color:var(--badInk)">' + esc(dg.last_error) + '</b>' : ''}</div></div>`;
+  }).join('');
+  const lg = $('#sLog'), lt = SP.log.join('\n');
+  if(lg.textContent !== lt){ const atEnd = lg.scrollHeight - lg.scrollTop - lg.clientHeight < 40; lg.textContent = lt; if(atEnd) lg.scrollTop = lg.scrollHeight; }
+}
+function bindSupport(){
+  document.querySelectorAll('.sform').forEach(f => {
+    const name = f.closest('section').id.slice(4);
+    const out = f.parentElement.querySelector('.sresult');
+    f.onsubmit = async e => { e.preventDefault(); out.innerHTML = 'Saving…';
+      const j = await supPost('/api/support/port', {name, port: f.port.value, baudrate: parseInt(f.baudrate.value)});
+      out.innerHTML = j.ok ? `<span style="color:var(--okInk)">✓ Saved. ${esc(labelOfInst(name))} is reconnecting on ${esc(j.saved.port)}. This is also saved in the settings file.</span>` : `<span style="color:var(--badInk)">${esc(j.error)}</span>`; };
+    f.querySelector('.sask').onclick = async () => { out.innerHTML = 'Asking… (3 seconds)';
+      const j = await supPost('/api/support/ask', {name});
+      out.innerHTML = !j.ok ? `<span style="color:var(--badInk)">${esc(j.error)}</span>`
+        : j.reply.length ? `<span style="color:var(--okInk)">✓ It answered, so data flows both ways.</span><pre style="margin-top:8px">${esc(j.reply.join('\n'))}</pre>`
+        : `<span style="color:var(--warnInk)">No answer to "${esc(j.command)}". That's not always a fault: some settings only send when Print is pressed. Try pressing Print and watch "What it sent".</span>`; };
+  });
+  document.querySelectorAll('.slisten').forEach(b => b.onclick = async () => {
+    const out = $('#sListen'); out.innerHTML = `Listening on <b>${esc(b.dataset.port)}</b> for 10 seconds. Press Print on the instrument now…`;
+    document.querySelectorAll('.slisten').forEach(x => x.disabled = true);
+    const j = await supPost('/api/support/listen', {port: b.dataset.port, baudrate: 9600, seconds: 10});
+    document.querySelectorAll('.slisten').forEach(x => x.disabled = false);
+    out.innerHTML = !j.ok ? `<span style="color:var(--badInk)">${esc(j.error)}</span>`
+      : `<b style="color:${j.good ? 'var(--okInk)' : j.bytes ? 'var(--warnInk)' : 'var(--badInk)'}">${esc(b.dataset.port)}: ${esc(j.verdict)}</b> (${j.bytes} bytes)${j.text ? '<pre style="margin-top:8px">' + esc(j.text) + '</pre>' : ''}`;
+  });
+  const rs = $('#sRescan'); if(rs) rs.onclick = () => { $('#app').innerHTML = ''; refresh(); };
+  const bm = $('#sSkBm');
+  if(bm){ bm.href = bookmarkletHref(); bm.onclick = e => { e.preventDefault(); alert('Drag this button onto the bookmarks bar instead of clicking it.'); }; }
+  const skf = $('#sSkForm');
+  if(skf){
+    const res = $('#sSkResult'), ser = $('#sSkSer');
+    ser.oninput = () => { ser.dataset.touched = '1'; };
+    const runTest = async () => { res.innerHTML = 'Testing… (up to 20 seconds)';
+      const j = await supPost('/api/support/skala_test', {});
+      if(!j.ok){ res.innerHTML = `<span style="color:var(--badInk)">${esc(j.error)}</span>`; return; }
+      const col = {ok:'var(--okInk)', bad:'var(--badInk)', warn:'var(--warnInk)', info:'var(--muted)'};
+      const mark = {ok:'✓', bad:'✗', warn:'!', info:'·'};
+      res.innerHTML = j.steps.map(([k, t, m]) => `<div style="padding:6px 0;border-top:1px solid var(--line2)"><b style="color:${col[k]}">${mark[k]} ${esc(t)}:</b> <span style="${k === 'info' ? 'font-family:var(--mono);font-size:12px;word-break:break-all' : ''}">${esc(m)}</span></div>`).join(''); };
+    skf.onsubmit = async e => { e.preventDefault(); res.innerHTML = 'Saving…';
+      const j = await supPost('/api/support/skala', {token: $('#sSkTok').value, sbs_serial: ser.value});
+      if(!j.ok){ res.innerHTML = `<span style="color:var(--badInk)">${esc(j.error)}</span>`; return; }
+      $('#sSkTok').value = ''; ser.dataset.touched = '';
+      res.innerHTML = '<span style="color:var(--okInk)">✓ Saved. Testing the connection…</span>'; setTimeout(runTest, 300); };
+    $('#sSkTest').onclick = runTest;
+  }
+}
+// ---------------- "Send to Lab Logger" bookmark ----------------
+// The bookmark runs on the SKALA page, opens this dashboard and passes the sign-in over with
+// postMessage (never in the address bar). Only messages from SKALA's own website are accepted.
+const SKALA_ORIGIN = /^https:\/\/([a-z0-9-]+\.)?skalacontrol\.(io|com)$/;
+function bookmarkletHref(){
+  const L = location.origin;
+  const code = `(function(){var L=${JSON.stringify(L)};function g(k){var v=localStorage.getItem(k)||'';try{var j=JSON.parse(v);if(typeof j==='string')v=j}catch(e){}return v}`
+    + `if(location.hostname.indexOf('skalacontrol')<0){alert('Open SKALA (skalacontrol.io) and sign in first, then click Send to Lab Logger again.');return}`
+    + `var t=g('exchange_token');if(!t){alert('Sign in to SKALA first, then click Send to Lab Logger again.');return}`
+    + `var s=g('applicationID');var w=window.open(L+'/#connect-skala','_blank');var n=0,done=false;`
+    + `window.addEventListener('message',function(e){if(e.origin===L&&e.data&&e.data.type==='lablogger-ack'){done=true}});`
+    + `var iv=setInterval(function(){if(done||n++>40){clearInterval(iv);return}try{w.postMessage({type:'lablogger-skala',token:t,serial:s},L)}catch(e){}},500)})();`;
+  return 'javascript:' + encodeURIComponent(code);
+}
+let connectState = {status: 'waiting', steps: [], error: ''};
+window.addEventListener('message', async e => {
+  if(!SKALA_ORIGIN.test(e.origin) || !e.data || e.data.type !== 'lablogger-skala') return;
+  if(connectState.status === 'sending' || connectState.status === 'done') { try { e.source.postMessage({type:'lablogger-ack'}, e.origin); } catch(x){} return; }
+  connectState = {status: 'sending', steps: [], error: ''}; renderConnect();
+  try { e.source.postMessage({type:'lablogger-ack'}, e.origin); } catch(x){}
+  try {
+    const j = await (await post('/api/skala_connect', {token: e.data.token, serial: e.data.serial})).json();
+    connectState = {status: 'done', ok: j.ok, steps: j.steps || [], error: j.error || ''};
+  } catch(x){ connectState = {status: 'done', ok: false, steps: [], error: 'Lab Logger didn\'t answer. Is it running?'}; }
+  renderConnect();
+});
+function renderConnect(){
+  if(location.hash.replace(/^#\/?/, '') !== 'connect-skala') return;
+  const c = connectState;
+  let body;
+  if(c.status === 'waiting') body = '<p style="margin:0;font-size:16px">Waiting for SKALA… If nothing happens, go back to the SKALA tab and click <b>Send to Lab Logger</b> again.</p>';
+  else if(c.status === 'sending') body = '<p style="margin:0;font-size:16px">Connecting to SKALA… (a few seconds)</p>';
+  else if(c.ok) body = '<div class="msg good" style="font-size:18px"><b>✓ SKALA is connected.</b> AQUALAB 3 readings will come through by themselves. You can close this tab.</div>';
+  else body = `<div class="msg err" style="font-size:16px"><b>SKALA didn't connect.</b> ${esc(c.error || (c.steps.find(s => s[0] === 'bad') || [, , 'Please try again.'])[2])}</div>
+     <p style="margin:0;font-size:15px">Make sure you're signed in to SKALA in the other tab, then click <b>Send to Lab Logger</b> again. Still not working? Tell ${esc((S && S.support) || 'your supervisor')}.</p>`;
+  $('#app').innerHTML = header(`<div class="row" style="justify-content:flex-start;gap:16px"><a class="back" href="#">${icon.back} All instruments</a><b style="font-size:20px">Connect SKALA</b></div>`)
+    + `<main><section class="card pad" style="gap:16px;max-width:720px">${body}</section></main>`;
+}
 async function refresh(){
   try {
     const keep = S && S._openFeed; S = await (await fetch('/api/state')).json(); S._openFeed = keep;
     const h = location.hash.replace(/^#\/?/, '');
     if(h.startsWith('device/')) D = await (await fetch('/api/device/' + h.slice(7))).json();
+    if(h === 'support') SP = await (await fetch('/api/support')).json();
     render();
   } catch(e){ $('#app').innerHTML = '<main><div class="card pad"><h2>Lab Logger isn\'t running</h2><p style="margin:0;font-size:15px">Double-click the <b>Lab Logger</b> icon on the desktop. This page comes back by itself.</p></div></main>'; }
 }
@@ -2091,7 +2845,8 @@ def start_dashboard(cfg, out_dir):
         return
     port = int(dc.get("port", 8080))
     DASH.update(out_dir=out_dir, station=cfg.get("station_name", ""), port=port,
-                support=dc.get("support_contact") or "your supervisor")
+                support=dc.get("support_contact") or "your supervisor",
+                support_pin=str(dc.get("support_pin") or ""))
     UPLOAD_CFG.update(cfg.get("upload", {}))
     allowed_hosts = {f"localhost:{port}", f"127.0.0.1:{port}", "localhost", "127.0.0.1"}
 
@@ -2124,6 +2879,10 @@ def start_dashboard(cfg, out_dir):
                 return self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
             if path == "/api/state":
                 return self._json(dashboard_state())
+            if path == "/api/version":
+                return self._json({"version": VERSION})
+            if path == "/api/support":
+                return self._json(support_state())
             if path.startswith("/api/device/"):
                 import urllib.parse
                 return self._json(device_state(urllib.parse.unquote(path[len("/api/device/"):])))
@@ -2159,6 +2918,64 @@ def start_dashboard(cfg, out_dir):
                 except ValueError as e:
                     return self._json({"ok": False, "error": str(e)}, 400)
                 return self._json({"ok": True, "assigned": n})
+            if path == "/api/skala_connect":
+                f = next((i for i in INSTRUMENTS.values() if isinstance(i, SkalaFetcher)), None)
+                if not f:
+                    return self._json({"ok": False, "error": "There's no SKALA (AQUALAB 3) entry in the settings."}, 400)
+                token = str(body.get("token", "")).strip().strip('"')
+                serial_id = str(body.get("serial", "")).strip().strip('"')
+                if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+                    return self._json({"ok": False, "error": "SKALA didn't hand over a sign-in. Sign in to SKALA, then click Send to Lab Logger again."}, 400)
+                try:
+                    save_skala_settings(f, token, serial_id or None)
+                    steps = skala_test_steps(f)
+                except ValueError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                good = all(k in ("ok", "info") for k, _, _ in steps)
+                log("SKALA reconnected with the Send to Lab Logger bookmark" + ("" if good else " (test found a problem)"))
+                return self._json({"ok": good, "steps": steps})
+            if path.startswith("/api/support/"):
+                pin = DASH.get("support_pin")
+                if pin and str(body.get("pin", "")) != str(pin):
+                    return self._json({"ok": False, "error": "Wrong support PIN.", "pin": True}, 403)
+                try:
+                    if path == "/api/support/port":
+                        return self._json({"ok": True, "saved": save_port_settings(str(body.get("name", "")), body)})
+                    if path == "/api/support/listen":
+                        return self._json({"ok": True, **listen_on_port(str(body.get("port", "")),
+                                                                         int(body.get("baudrate", 9600)),
+                                                                         int(body.get("seconds", 10)))})
+                    if path in ("/api/support/skala", "/api/support/skala_test"):
+                        f = next((i for i in INSTRUMENTS.values() if isinstance(i, SkalaFetcher)), None)
+                        if not f:
+                            raise ValueError("There's no SKALA (AQUALAB 3) entry in the settings.")
+                        if path == "/api/support/skala":
+                            save_skala_settings(f, body.get("token") or None, body.get("sbs_serial"))
+                            return self._json({"ok": True})
+                        return self._json({"ok": True, "steps": skala_test_steps(f)})
+                    if path == "/api/support/ask":
+                        inst = INSTRUMENTS.get(str(body.get("name", "")))
+                        if not isinstance(inst, SerialInstrument):
+                            raise ValueError("That instrument can't be asked questions.")
+                        cmd = QUERY_COMMANDS.get(inst.kind, "V")
+                        lines = inst.ask(cmd)
+                        return self._json({"ok": True, "command": cmd, "reply": lines})
+                except (ValueError, RuntimeError) as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                return self._json({"ok": False, "error": "unknown"}, 404)
+            if path == "/api/open_folder":
+                d = DEVICES.get(str(body.get("name", ""))) or {}
+                folder = d.get("folder")
+                if not folder:
+                    return self._json({"ok": False, "error": "No folder for that instrument."}, 400)
+                try:
+                    Path(folder).mkdir(parents=True, exist_ok=True)
+                    if hasattr(os, "startfile"):
+                        os.startfile(folder)
+                        return self._json({"ok": True})
+                    return self._json({"ok": False, "error": f"The folder is {folder}"}, 400)
+                except OSError as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
             if path == "/api/open_excel":
                 try:
                     return self._json({"ok": True, "path": EXCEL.open_copy()})
@@ -2271,20 +3088,49 @@ def already_running(port):
         return False
 
 
+def replace_older_copy(port):
+    """If an older version of Lab Logger is running (e.g. lab_logger.py was just replaced),
+    stop it so this one can start. Returns True if it was stopped."""
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    hdr = {"Host": f"localhost:{port}", "X-Lab-Logger": "1", "Content-Type": "application/json"}
+    try:
+        with opener.open(urllib.request.Request(f"http://127.0.0.1:{port}/api/version", headers=hdr), timeout=3) as r:
+            running = json.loads(r.read()).get("version")
+    except Exception:
+        running = None          # versions before this one don't report a version
+    if running == VERSION:
+        return False
+    log(f"An older Lab Logger is running (version {running or 'old'}); stopping it to start version {VERSION}.")
+    try:
+        opener.open(urllib.request.Request(f"http://127.0.0.1:{port}/api/shutdown", data=b"{}", headers=hdr,
+                                           method="POST"), timeout=5).read()
+    except Exception as e:
+        log(f"Couldn't ask the older Lab Logger to stop ({e}).")
+        return False
+    for _ in range(40):          # wait up to 20 s for it to finish saving and close
+        time.sleep(0.5)
+        if not already_running(port):
+            time.sleep(1)
+            return True
+    log("The older Lab Logger didn't stop in time.")
+    return False
+
+
 def run_logger():
     if serial is None:
         raise StartupProblem("A required part (pyserial) isn't installed. Double-click "
                              "\"Install Lab Logger parts.bat\" in this folder, then start Lab Logger again.")
     cfg = load_config()
     port = int(cfg.get("dashboard", {}).get("port", 8080))
-    if already_running(port):
-        # Someone double-clicked the launcher again: just bring up the dashboard.
+    if already_running(port) and not replace_older_copy(port):
+        # The same version is already running: just bring up the dashboard.
         import webbrowser
         webbrowser.open(f"http://localhost:{port}")
         return
     out_dir = expand(cfg.get("output_folder") or DEFAULT_CONFIG["output_folder"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    log(f"Lab logger started at station '{cfg.get('station_name', '')}'")
+    log(f"Lab logger started at station '{cfg.get('station_name', '')}' (version {VERSION})")
     log(f"Saving data to {out_dir}")
     SHARED.configure(cfg, out_dir)
     configure_lot_rules(cfg)
@@ -2422,6 +3268,7 @@ def run_demo():
     CONTEXT.update(lot="", operator="")
     mb = SerialInstrument({"name": "MB90", "type": "mb90", "port": "COM6"}, out_dir)
     ph = SerialInstrument({"name": "pH_meter", "type": "ph", "port": "COM3"}, out_dir)
+    mb.diag["open"] = ph.diag["open"] = True
     set_status("MB90", "USB · COM6 (simulated)", True)
     set_status("pH_meter", "USB · COM3 (simulated)", True)
     colo_dir = out_dir / "Colorimeter Exports"
