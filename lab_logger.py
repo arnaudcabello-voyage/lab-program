@@ -2206,6 +2206,62 @@ def dashboard_state():
             "history": load_upload_state().get("history", [])[:8]}
 
 
+_LAST_ROW_CACHE = {}
+
+
+def _last_csv_row(path):
+    """Last row of a CSV, re-read only when the file changes."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _LAST_ROW_CACHE.get(str(path))
+    if hit and hit[0] == key:
+        return hit[1]
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            rows = list(csv.DictReader(fh))
+    except Exception:
+        return None
+    last = rows[-1] if rows else None
+    _LAST_ROW_CACHE[str(path)] = (key, last)
+    return last
+
+
+def latest_full_result(name):
+    """Everything recorded for an instrument's most recent run: its own detailed record,
+    with the shared record's lot/operator (including lots assigned later) on top."""
+    out_dir = DASH.get("out_dir")
+    detail = None
+    if out_dir:
+        folder = out_dir / name
+        files = sorted(f for f in folder.glob(f"{name}_*.csv") if "_curves_" not in f.name) if folder.exists() else []
+        for f in reversed(files):
+            detail = _last_csv_row(f)
+            if detail:
+                break
+    shared = None
+    for r in reversed(read_all_results()):
+        if r.get("instrument") == name:
+            shared = r
+            break
+    if not detail and not shared:
+        return None
+    merged = dict(detail or {})
+    merged.pop("raw_json", None)
+    merged.pop("raw_text", None)
+    if shared and (not detail or shared.get("logged_at") == merged.get("logged_at")
+                   or shared.get("record_id") == merged.get("record_id")):
+        for k in ("lot", "operator", "note", "measurement", "value", "unit", "lot_assigned_later",
+                  "assigned_by", "assigned_at", "std_L*", "std_a*", "std_b*"):
+            if shared.get(k):
+                merged[k] = shared[k]
+    elif shared and not detail:
+        merged = {k: v for k, v in shared.items() if k not in ("raw_text", "_month")}
+    return merged
+
+
 def device_state(name):
     with DEV_LOCK:
         d = dict(DEVICES.get(name) or {})
@@ -2213,7 +2269,7 @@ def device_state(name):
         lines = list(lv.get("lines") or [])[-60:]
         test = json.loads(json.dumps(lv.get("test"))) if lv.get("test") else None
         results = [r for r in RECENT if r["instrument"] == name][:30]
-    return {"device": d, "lines": lines, "test": test, "results": results}
+    return {"device": d, "lines": lines, "test": test, "results": results, "latest": latest_full_result(name)}
 
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -2448,9 +2504,76 @@ function curveSvg(points){
     <circle cx="${X(xs[xs.length-1])}" cy="${Y(ys[ys.length-1])}" r="5" fill="#1F5FBF"/></svg>`;
 }
 
+// ---------------- Full details of an instrument's latest run ----------------
+const yesNo = v => /^(true|yes|1)$/i.test(String(v)) ? 'Yes' : /^(false|no|0)$/i.test(String(v)) ? 'No' : v;
+const withUnit = u => v => v === '' || v == null ? '' : v + ' ' + u;
+const mmss = v => { const n = parseFloat(v); if(isNaN(n)) return v; const m = Math.floor(n / 60), s = Math.round(n % 60); return m + ' min ' + String(s).padStart(2, '0') + ' s'; };
+const when2 = v => { if(!v) return ''; const d = new Date(String(v).replace(' ', 'T')); return isNaN(d) ? v : d.toLocaleString([], {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'}); };
+const RECORD_TYPES = {moisture_test:'Moisture test', moisture_test_incomplete:'Moisture test (stopped early)', weight_adjustment:'Weight calibration',
+  temperature_adjustment:'Temperature calibration', statistics:'Statistics printout', other:'Printout'};
+const DETAILS = {
+  mb90: [['record_type','Type', v => RECORD_TYPES[v] || v], ['start_weight_g','Start weight', withUnit('g')], ['total_time','Drying time', withUnit('min')],
+    ['drying_temp_C','Drying temperature', withUnit('°C')], ['drying_program','Drying program'], ['method_name','Method'], ['switch_off','Switch-off'],
+    ['curve_points','Drying-curve points'], ['nominal_weight_g','Calibration weight', withUnit('g')], ['actual_weight_g','Weight measured', withUnit('g')],
+    ['difference_g','Difference', withUnit('g')], ['cell_temperature_C','Balance temperature', withUnit('°C')], ['adjustment','Calibration result'],
+    ['temp1_target_C','Point 1 target', withUnit('°C')], ['temp1_actual_C','Point 1 measured', withUnit('°C')], ['temp2_target_C','Point 2 target', withUnit('°C')],
+    ['temp2_actual_C','Point 2 measured', withUnit('°C')], ['stat_sample_number','Tests in statistics'], ['stat_mean','Average'], ['stat_std_dev','Standard deviation'],
+    ['stat_min','Lowest'], ['stat_max','Highest'], ['serial_number','Instrument serial'], ['software_version','Software version']],
+  ph: [['mV','Millivolts', withUnit('mV')], ['temperature','Temperature', (v, r) => v === '' ? '' : v + ' °' + (r.temp_unit || 'C')],
+    ['temp_type','Temperature from', v => v === 'ATC' ? 'Probe (ATC)' : v === 'MTC' ? 'Entered by hand (MTC)' : v],
+    ['slope_pct','Electrode slope', withUnit('%')], ['offset_mV','Electrode offset', withUnit('mV')], ['ORP_RmV','ORP', withUnit('mV')],
+    ['conductivity','Conductivity'], ['tds_mg_L','TDS', withUnit('mg/L')], ['sample_id','Sample ID'], ['user_id','Meter user ID'],
+    ['meter_datetime','Meter time'], ['calibration_record','Calibration report', yesNo], ['meter_model','Meter model'], ['serial_number','Meter serial']],
+  skala_api: [['temperature_C','Temperature', withUnit('°C')], ['duration','Test time', mmss], ['reading_datetime','Reading taken', when2],
+    ['in_spec','In spec', yesNo], ['in_haccp_spec','In HACCP spec', yesNo], ['spec_min','Spec range', (v, r) => v === '' && r.spec_max === '' ? '' : (v || '—') + ' to ' + (r.spec_max || '—') + ' aw'],
+    ['status','SKALA status'], ['product','Product'], ['batch_name','Batch'], ['batch_date','Batch date'], ['sample_fields','Sample details'],
+    ['test','Test'], ['dual_block_difference','Sensor block difference', withUnit('aw')], ['is_fast','Fast mode', yesNo],
+    ['supervisor_approved','Supervisor approved', yesNo], ['void','Voided', yesNo], ['comment','Comment'], ['tag','Tag'],
+    ['instrument_sn','Instrument serial'], ['instrument_verified_at','Last verified', when2], ['skala_user_id','SKALA user ID']],
+};
+DETAILS.export_folder = DETAILS.skala_api;
+const SKIP_COLOR = new Set(['logged_at','instrument','lot','operator','note','source_file','sheet','row','measurement','value','unit','record_id',
+  'lot_assigned_later','assigned_by','assigned_at','L*','a*','b*','std_L*','std_a*','std_b*','_month']);
+function headline(type, r){
+  const big = (v, u) => `<div style="display:flex;align-items:baseline;gap:10px"><span class="big" style="font-size:56px;line-height:1">${esc(v === '' || v == null ? '—' : v)}</span><span class="muted" style="font-size:20px">${esc(u || '')}</span></div>`;
+  if(type === 'colorimeter_folder'){
+    const L = r['L*'] ?? r['Sample L*'] ?? '', a = r['a*'] ?? r['Sample a*'] ?? '', b = r['b*'] ?? r['Sample b*'] ?? '';
+    return `<div style="display:flex;flex-wrap:wrap;gap:28px">${[['L*', L], ['a*', a], ['b*', b]].map(([k, v]) =>
+      `<div style="display:flex;flex-direction:column;gap:2px"><span class="muted" style="font-size:13px">${k}</span><span class="big" style="font-size:44px;line-height:1">${esc(v || '—')}</span></div>`).join('')}</div>`;
+  }
+  if(type === 'skala_api' || type === 'export_folder') return big(r.water_activity || r.value, 'aw');
+  if(type === 'ph') return r.calibration_record ? big(r.slope_pct, '% slope (calibration)') : big(r.pH || r.value, 'pH');
+  if(type === 'mb90'){
+    if(r.record_type === 'weight_adjustment') return big(r.difference_g, 'g difference');
+    if(r.record_type === 'temperature_adjustment') return big(r.adjustment || '—', '');
+    return big(r.end_result || r.value, r.end_result_unit || r.unit);
+  }
+  return big(r.value, r.unit);
+}
+function latestPanel(d, r){
+  if(!r) return `<div class="row"><h2>Latest result</h2></div><p class="muted" style="margin:0">${hint(d)}</p>`;
+  let pairs = [];
+  if(d.type === 'colorimeter_folder'){
+    const NAMES = {'NO':'Record number', 'No':'Record number', 'Test Name':'Test name', 'DateTime':'Measured', 'Date Time':'Measured', 'Date':'Measured',
+      'SCAA':'SCAA roast number', 'HCCI':'HCCI', 'Roast Degree':'Roast degree', 'dE*ab':'Color difference (ΔE*ab)', 'ΔE*ab':'Color difference (ΔE*ab)'};
+    pairs = Object.entries(r).filter(([k, v]) => !SKIP_COLOR.has(k) && v !== '' && v != null)
+      .map(([k, v]) => [NAMES[k] || k, /date|time/i.test(k) ? when2(v) : v]);
+    if(r['std_L*'] !== undefined && r['std_L*'] !== '') pairs.unshift(['Standard L* a* b*', [r['std_L*'], r['std_a*'], r['std_b*']].join(', ')]);
+  } else {
+    pairs = (DETAILS[d.type] || []).map(([k, label, fmt]) => [label, r[k] === undefined || r[k] === '' ? '' : (fmt ? fmt(r[k], r) : r[k])]).filter(([, v]) => v !== '' && v != null);
+  }
+  const lotText = (r.lot || 'no lot') + (r.lot_assigned_later ? ' (assigned later by ' + (r.assigned_by || '?') + ')' : '');
+  const run = [['Lot', lotText], ['Operator', r.operator || '—'], ['Note', r.note], ['Saved', when2(r.logged_at)]].filter(([, v]) => v);
+  const grid = list => `<dl class="kv" style="margin:0;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));flex:none">${list.map(([k, v]) =>
+      `<div><dt style="font-size:12px;color:var(--muted)">${esc(k)}</dt><dd style="margin:0;font-family:var(--sans);font-size:16px;word-break:break-word">${esc(v)}</dd></div>`).join('')}</dl>`;
+  return `<div class="row" style="flex-wrap:wrap"><h2>Latest result</h2><span class="muted" style="font-size:13px">${esc(r.measurement || '')}</span></div>
+    ${headline(d.type, r)}
+    ${pairs.length ? grid(pairs) : ''}
+    <div style="border-top:1px solid var(--line2);padding-top:14px">${grid(run)}</div>`;
+}
 function viewDevice(name){
   if(!D || !D.device || D.device.name !== name) return topbar() + '<main><p class="muted">Loading…</p></main>';
-  const d = D.device, t = D.test, last = D.results[0];
+  const d = D.device, t = D.test;
   let livePanel = '';
   if(d.type === 'mb90' && t){
     livePanel = `<div class="row" style="flex-wrap:wrap"><h2>${t.active ? 'Live test' : 'Last test'}</h2>
@@ -2460,10 +2583,11 @@ function viewDevice(name){
         <div class="kv"><div><span>Elapsed</span><span>${esc(t.elapsed||'—')}</span></div><div><span>Drying temp</span><span>${t.temp ? esc(t.temp)+' °C' : '—'}</span></div>
         <div><span>Start weight</span><span>${t.start_weight ? esc(t.start_weight)+' g' : '—'}</span></div><div><span>Method</span><span style="font-family:var(--sans);font-size:16px">${esc(t.method||'—')}</span></div></div></div>
       <figure style="margin:0">${curveSvg(t.points)}</figure>`;
+    livePanel = t.active
+      ? livePanel + `<div style="border-top:1px solid var(--line);padding-top:20px;display:flex;flex-direction:column;gap:16px">${latestPanel(d, D.latest).replace('<h2>Latest result</h2>', '<h2>Previous result</h2>')}</div>`
+      : latestPanel(d, D.latest) + `<details id="curveBox"><summary style="cursor:pointer;min-height:44px;display:flex;align-items:center;font-size:14px;color:var(--muted)">Show the drying curve</summary>${curveSvg(t.points)}</details>`;
   } else {
-    livePanel = `<div class="row"><h2>Latest result</h2>${last ? '<span class="muted" style="font-size:13px">' + esc(last.time.replace('T',' ').slice(0,16)) + '</span>' : ''}</div>
-      <div style="display:flex;align-items:baseline;gap:10px"><span class="big" style="font-size:64px;line-height:1">${last ? esc(last.value) : '—'}</span><span class="muted" style="font-size:20px">${last ? esc(last.unit) : ''}</span></div>
-      <p class="muted" style="margin:0">${last ? esc(last.measurement) + (last.lot ? ' · lot ' + esc(last.lot) : '') + (last.operator ? ' · ' + esc(last.operator) : '') : hint(d)}</p>`;
+    livePanel = latestPanel(d, D.latest);
   }
   const lines = D.lines.length ? esc(D.lines.map(l => l[1]).join('\n')) : '';
   const feed = (d.type === 'mb90' || d.type === 'ph')
